@@ -1,0 +1,56 @@
+{
+  "name": "@local/dsh-tool-slice",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "description": "按需关闭工具定义，并把任务拆成 Markdown 计划、逐步交给子代理执行，压缩本地小模型的上下文。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./step-tools": "./step-tools.js",
+    "./core": "./core.mjs",
+    "./workflow": "./workflow.mjs",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "step-tools.js",
+    "core.mjs",
+    "workflow.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/core.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hawkqiang/dsh-tool-slice.git"
+  },
+  "homepage": "https://github.com/hawkqiang/dsh-tool-slice#readme",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "context-engineering"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

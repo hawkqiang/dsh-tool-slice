@@ -1,0 +1,81 @@
+# tool-slice bundle patch.
+#
+# Two rows:
+#   tool-slice  — Host plugin: the per-profile tool mask and its browser page.
+#   preset-lean — a small Agent preset: core tools plus the slice workflow,
+#                 for local models that cannot afford the standard prompt.
+#
+# The standard preset is untouched, so nothing here changes existing Sessions.
+
+- insert:
+    - id: tool-slice
+      name: '@local/dsh-tool-slice'
+
+    - id: preset-lean
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lean
+        name: 精简（切片）
+        description: 只挂核心工具，用 Markdown 计划把任务拆成小步、逐步交给子代理执行。适合本地 9B 这类上下文紧张的小模型。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                You are a coding agent powered by the {{model}} model.
+                默认用中文回答。
+                动手前先查证：用 read / grep / glob 看清现状再改，不要凭记忆猜代码。
+                改动尽量小，沿用仓库已有写法；不要顺手重构无关代码。
+                工具结果很长时只提取需要的几行，不要复述整段内容。
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          # The slice workflow: plan_write + step_run and their prompt section.
+          # It lives in the preset, so only Sessions on this preset pay for it.
+          - id: step-tools
+            name: '@local/dsh-tool-slice/step-tools'
+
+          # Compact earlier than standard too: a 64k window on a 9B model
+          # degrades long before it is full.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 4096
+                  headChars: 2048
+                  tailChars: 768

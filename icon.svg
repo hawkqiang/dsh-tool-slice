@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Tool slice">
+  <defs>
+    <linearGradient id="tsl-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b6cb0"/>
+      <stop offset="1" stop-color="#1a365d"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#tsl-bg)"/>
+  <g fill="none" stroke="#e6f0fb" stroke-width="3.2" stroke-linecap="round">
+    <path d="M13 20h38"/>
+    <path d="M13 32h38"/>
+    <path d="M13 44h38"/>
+  </g>
+  <g fill="#7fd1ff">
+    <circle cx="24" cy="20" r="5" stroke="#0f2743" stroke-width="2"/>
+    <circle cx="41" cy="32" r="5" stroke="#0f2743" stroke-width="2"/>
+    <circle cx="19" cy="44" r="5" stroke="#0f2743" stroke-width="2"/>
+  </g>
+</svg>

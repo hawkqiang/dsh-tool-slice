@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Tool switches and slice workflow",
+    "description": "Turn unused tool definitions off to shrink the prompt, and split a task into a Markdown plan whose steps run one at a time in fresh subagents."
+  }
+}
