@@ -1,9 +1,11 @@
 # tool-slice bundle patch.
 #
 # Two rows:
-#   tool-slice  — Host plugin: the per-profile tool mask and its browser page.
-#   preset-lean — a small Agent preset: core tools plus the slice workflow,
-#                 for local models that cannot afford the standard prompt.
+#   tool-slice        — Host plugin: the per-profile tool mask and its browser page.
+#   preset-plan-act   — the "plan-act" Agent preset: core tools plus the
+#                       plan_write (plan) → step_run (act) workflow, for local
+#                       small models (e.g. 9B) that cannot afford the standard
+#                       prompt and over-think when a turn is too big.
 #
 # The standard preset is untouched, so nothing here changes existing Sessions.
 
@@ -11,12 +13,12 @@
     - id: tool-slice
       name: '@local/dsh-tool-slice'
 
-    - id: preset-lean
+    - id: preset-plan-act
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: lean
-        name: 精简（切片）
-        description: 只挂核心工具，用 Markdown 计划把任务拆成小步、逐步交给子代理执行。适合本地 9B 这类上下文紧张的小模型。
+        id: plan-act
+        name: plan-act
+        description: 先多轮讨论把任务拆成小步计划（plan），再一步一步执行（act），每步交给独立子代理，让 9B 这类小模型一次只做一件小事，避免长篇大思考。
         order: 5
         plugins:
           - id: persona
@@ -25,9 +27,10 @@
               prefix: |
                 You are a coding agent powered by the {{model}} model.
                 默认用中文回答。
+                一次只推进一小步：复杂任务先 plan_write 拆成小步，再 step_run 一步步做，不要一次全做完。
+                输出要短：只给结论和关键事实，不要长篇推理，不要复述任务或工具原文。
                 动手前先查证：用 read / grep / glob 看清现状再改，不要凭记忆猜代码。
                 改动尽量小，沿用仓库已有写法；不要顺手重构无关代码。
-                工具结果很长时只提取需要的几行，不要复述整段内容。
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
 
@@ -43,6 +46,10 @@
               applyPatch: false
           - id: tool-fs-search
             name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              # Required by the plugin's schema; false keeps glob output verbatim
+              # instead of sampling it, so a small model sees exactly what matched.
+              sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
           - id: tool-web
@@ -52,11 +59,15 @@
               searchTimeoutMs: 60000
           - id: tool-todo
             name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              # Required by the plugin's schema.
+              allowParallelInProgress: true
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
 
-          # The slice workflow: plan_write + step_run and their prompt section.
-          # It lives in the preset, so only Sessions on this preset pay for it.
+          # plan-act: plan_write (plan) + step_run (act) and their prompt
+          # section. It lives in the preset, so only Sessions on this preset pay
+          # for it.
           - id: step-tools
             name: '@local/dsh-tool-slice/step-tools'
 

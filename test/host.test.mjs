@@ -4,7 +4,29 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { apply } from '../index.js'
-import { renderPlan } from '../core.mjs'
+import { renderPlan, parsePlan } from '../core.mjs'
+import { recordPlanLocation, touchPlanIndex } from '../workflow.mjs'
+
+/** Write a plan file for one session and register it where the panel looks. */
+function seedPlan(h, sessionId) {
+  const dir = path.join(h.profile, '.dsh', 'plans')
+  fs.mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, `plan-${sessionId.slice(-8)}.md`)
+  fs.writeFileSync(file, renderPlan({
+    goal: '把登录换成 JWT',
+    steps: [
+      { n: 1, title: '盘点签发点', task: '读 src/auth', done: '给出清单', status: '待办' },
+      { n: 2, title: '实现签发', task: '签 access+refresh', done: '单测通过', status: '待办' },
+    ],
+  }), 'utf8')
+  recordPlanLocation(sessionId, h.profile, file)
+  return file
+}
+
+function post(h, route, sessionId, body) {
+  const url = `http://localhost${route}?session=${encodeURIComponent(sessionId)}`
+  return h.routes.get(route).fetch(new Request(url, { method: 'POST', body: JSON.stringify(body) }))
+}
 
 /** A minimal Cordis-shaped context with the services this plugin uses. */
 function harness() {
@@ -14,8 +36,16 @@ function harness() {
   const routes = new Map()
   const commands = new Map()
   const warnings = []
+  const spawns = []
   const ctx = {
     logger: { warn: (message) => warnings.push(String(message)) },
+    // A step's child only needs a service that hands back a finished result.
+    subagents: {
+      startActivation: async (spec) => {
+        spawns.push(spec)
+        return { result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: `${spec.label} 完成` }] }) }
+      },
+    },
     on(name, handler) {
       const list = handlers.get(name) ?? []
       list.push(handler)
@@ -49,6 +79,7 @@ function harness() {
     warnings,
     routes,
     commands,
+    spawns,
     fire(name, payload, ...rest) {
       for (const handler of handlers.get(name) ?? []) handler(payload, ...rest)
     },
@@ -56,6 +87,9 @@ function harness() {
     planIndexFile: path.join(profile, 'tool-slice-plans.json'),
   }
 }
+
+/** The tools a plan-act session mounts; the dock refuses to plan without them. */
+const PLAN_ACT_TOOLS = ['plan_options', 'plan_write', 'step_run', 'read', 'glob', 'grep']
 
 function fakeAgent(id, names, calls) {
   const definitions = names.map((name) => ({
@@ -294,13 +328,13 @@ test('the /slice command is registered with its hint', () => {
   const h = harness()
   const slice = h.commands.get('slice')
   assert.ok(slice, 'slice command exists')
-  assert.match(slice.description, /切片工作法/)
+  assert.match(slice.description, /plan-act/)
   assert.match(slice.input.hint, /plan/)
 })
 
 test('/slice rejects an unknown argument instead of guessing', async () => {
   const h = harness()
-  const result = await h.commands.get('slice').handler({ agent: fakeAgent('s-a', [], []), rawInput: 'explode' })
+  const result = await h.commands.get('slice').handler({ agent: fakeAgent('s-a', PLAN_ACT_TOOLS, []), rawInput: 'explode' })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /不认识的参数/)
 })
@@ -309,7 +343,7 @@ test('/slice plan asks the model to discuss before decomposing', async () => {
   const h = harness()
   const sent = []
   const agent = {
-    ...fakeAgent('s-a', [], []),
+    ...fakeAgent('s-a', PLAN_ACT_TOOLS, []),
     followup: async (input) => { sent.push(input) },
   }
   const result = await h.commands.get('slice').handler({ agent, rawInput: 'plan 给登录页加验证码' })
@@ -327,7 +361,7 @@ test('/slice revise forwards the feedback with the current goal', async () => {
   const h = harness()
   const sent = []
   const agent = {
-    ...fakeAgent('plan2', [], []),
+    ...fakeAgent('plan2', PLAN_ACT_TOOLS, []),
     followup: async (input) => { sent.push(input) },
   }
   const file = path.join(h.profile, '.dsh', 'plans', 'plan-plan2.md')
@@ -350,7 +384,7 @@ test('/slice revise forwards the feedback with the current goal', async () => {
 test('/slice revise works without a plan file yet', async () => {
   const h = harness()
   const sent = []
-  const agent = { ...fakeAgent('plan3', [], []), followup: async (input) => { sent.push(input) } }
+  const agent = { ...fakeAgent('plan3', PLAN_ACT_TOOLS, []), followup: async (input) => { sent.push(input) } }
   const result = await h.commands.get('slice').handler({ agent, rawInput: 'revise 先别做界面' })
   assert.equal(result.kind, 'success')
   assert.match(sent[0].content[0].text, /先别做界面/)
@@ -359,7 +393,7 @@ test('/slice revise works without a plan file yet', async () => {
 
 test('/slice next without a plan explains the next move', async () => {
   const h = harness()
-  const agent = fakeAgent('s-a', [], [])
+  const agent = fakeAgent('s-a', PLAN_ACT_TOOLS, [])
   const result = await h.commands.get('slice').handler({ agent, rawInput: 'next' })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /还没有计划文件/)
@@ -572,4 +606,199 @@ test('the snapshot offers built-in scenarios derived from the real groups', asyn
   const minimal = snapshot.builtInScenarios.find((scenario) => scenario.name === '极简')
   assert.ok(minimal.hidden.includes('pwsh') && minimal.hidden.includes('web_search'))
   assert.ok(!minimal.hidden.includes('read'))
+})
+
+test('/api/tool-slice/approve confirms a plan with no Agent running', async () => {
+  const h = harness()
+  const file = seedPlan(h, 's-a')
+  assert.equal(parsePlan(fs.readFileSync(file, 'utf8')).approvedAt, '')
+
+  const response = await post(h, '/api/tool-slice/approve', 's-a', { approved: true })
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.plan.approved, true)
+  assert.notEqual(parsePlan(fs.readFileSync(file, 'utf8')).approvedAt, '', 'the file is the source of truth')
+
+  const off = await (await post(h, '/api/tool-slice/approve', 's-a', { approved: false })).json()
+  assert.equal(off.plan.approved, false)
+  assert.equal(parsePlan(fs.readFileSync(file, 'utf8')).approvedAt, '')
+})
+
+test('/api/tool-slice/approve refuses a session with no plan', async () => {
+  const h = harness()
+  const response = await post(h, '/api/tool-slice/approve', 's-none', { approved: true })
+  assert.equal(response.status, 400)
+  assert.match((await response.json()).error, /还没有计划/)
+})
+
+test('/api/tool-slice/step writes one step model and tool policy', async () => {
+  const h = harness()
+  const file = seedPlan(h, 's-a')
+
+  const response = await post(h, '/api/tool-slice/step', 's-a', {
+    step: 1, model: 'local/Qwen3.8-9B-Q6_K', hidden: ['web_search', 'web_search', 'web_fetch'],
+  })
+  const body = await response.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.plan.steps[0].model, 'local/Qwen3.8-9B-Q6_K')
+  assert.deepEqual(body.plan.steps[0].hidden, ['web_fetch', 'web_search'])
+  assert.equal(body.plan.steps[1].model, '', 'other steps are untouched')
+
+  const parsed = parsePlan(fs.readFileSync(file, 'utf8'))
+  assert.equal(parsed.steps[0].model, 'local/Qwen3.8-9B-Q6_K')
+  assert.deepEqual(parsed.steps[0].hidden, ['web_fetch', 'web_search'])
+  assert.equal(parsed.approvedAt, '', 'editing a step does not silently confirm the plan')
+})
+
+test('/api/tool-slice/step rejects a bad step number', async () => {
+  const h = harness()
+  seedPlan(h, 's-a')
+  const missing = await post(h, '/api/tool-slice/step', 's-a', { step: 9, model: 'x/y' })
+  assert.equal(missing.status, 400)
+  assert.match((await missing.json()).error, /没有第 9 步/)
+
+  const invalid = await post(h, '/api/tool-slice/step', 's-a', { step: 0, model: 'x/y' })
+  assert.equal(invalid.status, 400)
+  assert.match((await invalid.json()).error, /步骤号无效/)
+})
+
+test('/api/tool-slice/models answers even with no LLM service', async () => {
+  const h = harness()
+  const response = await h.routes.get('/api/tool-slice/models').fetch()
+  const body = await response.json()
+  assert.equal(body.ok, true)
+  assert.deepEqual(body.routes, [], 'the picker falls back to "inherit"')
+})
+
+test('/slice approve gates the model-facing step_run', async () => {
+  const h = harness()
+  const file = seedPlan(h, 's-a')
+  const agent = { ...fakeAgent('s-a', PLAN_ACT_TOOLS, []), followup: async () => {} }
+
+  const result = await h.commands.get('slice').handler({ agent, rawInput: 'approve' })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /已确认/)
+  assert.notEqual(parsePlan(fs.readFileSync(file, 'utf8')).approvedAt, '')
+
+  const off = await h.commands.get('slice').handler({ agent, rawInput: 'unapprove' })
+  assert.equal(off.kind, 'success')
+  assert.match(off.text, /取消确认/)
+  assert.equal(parsePlan(fs.readFileSync(file, 'utf8')).approvedAt, '')
+})
+
+test('/slice approve without a plan reports the missing plan', async () => {
+  const h = harness()
+  const agent = { ...fakeAgent('s-none', ['read'], []), followup: async () => {} }
+  const result = await h.commands.get('slice').handler({ agent, rawInput: 'approve' })
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /还没有计划文件/)
+})
+test('a session without the plan-act tools is told why, instead of silently doing nothing', async () => {
+  const h = harness()
+  // A standard-preset session: the dock is mounted profile-wide, but the preset
+  // owns plan_write/step_run, so these commands have nothing behind them.
+  const agent = { ...fakeAgent('s-std', ['read', 'write', 'subagent'], []), followup: async () => {} }
+
+  for (const line of ['plan 修图', 'next', 'revise 改成 4 步']) {
+    const result = await h.commands.get('slice').handler({ agent, rawInput: line })
+    assert.equal(result.kind, 'error', `${line} must refuse`)
+    assert.match(result.text, /没有 plan-act 的计划工具/)
+    assert.match(result.text, /plan_write/, 'it names what is missing')
+    assert.match(result.text, /新开一个预设选 plan-act 的会话/, 'and what to do instead')
+  }
+})
+
+test('a plan-act session is not blocked by that guard', async () => {
+  const h = harness()
+  const sent = []
+  const agent = { ...fakeAgent('s-plan', PLAN_ACT_TOOLS, []), followup: async (input) => { sent.push(input) } }
+  const result = await h.commands.get('slice').handler({ agent, rawInput: 'plan 修图' })
+  assert.equal(result.kind, 'success')
+  assert.equal(sent.length, 1)
+})
+test('/slice parallel starts only the steps whose dependencies are met', async () => {
+  const h = harness()
+  const agent = { ...fakeAgent('s-par5', PLAN_ACT_TOOLS, []), followup: async () => {} }
+  const file = path.join(h.profile, '.dsh', 'plans', 'plan-s-par5.md')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, renderPlan({
+    goal: '并行',
+    approvedAt: '2026-11-21 00:00',
+    steps: [
+      { n: 1, title: '甲', task: '独立一', status: '待办' },
+      { n: 2, title: '乙', task: '独立二', status: '待办' },
+      { n: 3, title: '丙', task: '依赖甲', status: '待办', dependsOn: [1] },
+    ],
+  }))
+  touchPlanIndex(agent, h.profile, file)
+
+  const result = await h.commands.get('slice').handler({ agent, rawInput: 'parallel' })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /并行跑了 2 步/, 'the dependent step did not start')
+  assert.deepEqual(h.spawns.map((spec) => spec.label).sort(), ['step 1', 'step 2'])
+})
+
+test('/slice stop says plainly when nothing is running', async () => {
+  const h = harness()
+  const agent = fakeAgent('s-par6', PLAN_ACT_TOOLS, [])
+  const result = await h.commands.get('slice').handler({ agent, rawInput: 'stop' })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /没有在执行的步骤可停止/)
+})
+test('the profile default policy is saved once and served back with the plan', async () => {
+  const h = harness()
+  const save = h.routes.get('/api/tool-slice/save')
+  const response = await save.fetch(new Request('http://localhost/api/tool-slice/save', {
+    method: 'POST',
+    body: JSON.stringify({ defaults: true, access: '只读' }),
+  }))
+  assert.equal(response.status, 200)
+  const saved = JSON.parse(fs.readFileSync(h.stateFile, 'utf8'))
+  assert.deepEqual(saved.planDefaults, { access: '只读', hidden: [] }, 'the default survives the save')
+
+  const agent = fakeAgent('s-dflt99', PLAN_ACT_TOOLS, [])
+  const file = path.join(h.profile, '.dsh', 'plans', 'plan-s-dflt99.md')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, renderPlan({
+    goal: 'g',
+    steps: [{ n: 1, title: '甲', task: 'x', status: '待办' }],
+  }))
+  touchPlanIndex(agent, h.profile, file)
+
+  const plan = h.routes.get('/api/tool-slice/plan')
+  const snapshot = await (await plan.fetch(new Request(`http://localhost/api/tool-slice/plan?session=${encodeURIComponent('s-dflt99')}`))).json()
+  assert.deepEqual(snapshot.plan.defaults, { access: '只读', hidden: [] }, 'the panel can show the default')
+  assert.equal(snapshot.plan.running, false)
+  assert.deepEqual(snapshot.plan.stats, {}, 'no steps have run, so no cost counters yet')
+})
+test('/slice auto only starts when the plan is approved and has ready work', async () => {
+  const h = harness()
+  const sent = []
+  const agent = { ...fakeAgent('s-auto77', PLAN_ACT_TOOLS, []), followup: async (input) => { sent.push(input) } }
+  const file = path.join(h.profile, '.dsh', 'plans', 'plan-s-auto77.md')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, renderPlan({
+    goal: '自动跑',
+    approvedAt: '',
+    steps: [{ n: 1, title: '甲', task: 'a', status: '待办' }],
+  }))
+  touchPlanIndex(agent, h.profile, file)
+
+  const refused = await h.commands.get('slice').handler({ agent, rawInput: 'auto' })
+  assert.equal(refused.kind, 'error')
+  assert.match(refused.text, /还没确认/)
+  assert.equal(sent.length, 0, 'an unconfirmed plan never starts the model')
+
+  // Confirm through the same route the panel uses, then ask again.
+  const approve = h.routes.get('/api/tool-slice/approve')
+  await approve.fetch(new Request('http://localhost/api/tool-slice/approve?session=s-auto77', {
+    method: 'POST',
+    body: JSON.stringify({ approved: true }),
+  }))
+  const started = await h.commands.get('slice').handler({ agent, rawInput: 'auto' })
+  assert.equal(started.kind, 'success')
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].content[0].text, /自动顺次执行/)
+  assert.match(started.text, /自动顺次执行/)
 })

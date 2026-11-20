@@ -35,11 +35,11 @@ test('the client registers the bundle config page under the package name', () =>
   assert.match(client, new RegExp(`const NS = '${manifest.name}'`))
 })
 
-test('the patch inserts the host row and the lean preset', () => {
+test('the patch inserts the host row and the plan-act preset', () => {
   const patch = read('cordis.patch.yml')
   assert.match(patch, /- id: tool-slice\n\s+name: '@local\/dsh-tool-slice'/)
-  assert.match(patch, /- id: preset-lean\n\s+name: '@deepseek-ai\/dsh-agent-preset'/)
-  assert.match(patch, /id: lean/)
+  assert.match(patch, /- id: preset-plan-act\n\s+name: '@deepseek-ai\/dsh-agent-preset'/)
+  assert.match(patch, /id: plan-act/)
   assert.match(patch, /'@local\/dsh-tool-slice\/step-tools'/)
   assert.match(patch, /'@deepseek-ai\/dsh-compaction-basic'/)
   const manifest = JSON.parse(read('package.json'))
@@ -56,6 +56,16 @@ test('the patch names no unknown local export', () => {
     const suffix = `./${ref.slice(manifest.name.length + 1)}`
     assert.ok(manifest.exports[suffix] !== undefined, `export missing for patch reference: ${ref}`)
   }
+})
+
+// A preset row whose plugin schema marks a field required makes the whole
+// composition fail to activate ("加载失败" in Settings) with only that one row
+// named in the diagnostic. These two shipped tools require their flag, so the
+// preset must spell them out exactly like the shipped standard preset does.
+test('preset rows carry the config fields their plugins require', () => {
+  const patch = read('cordis.patch.yml')
+  assert.match(patch, /name: '@deepseek-ai\/dsh-tool-fs-search'\n\s+config:\n(\s+#.*\n)*\s+sampleOverCapGlobResults: false/)
+  assert.match(patch, /name: '@deepseek-ai\/dsh-tool-todo'\n\s+config:\n(\s+#.*\n)*\s+allowParallelInProgress: true/)
 })
 
 test('locales parse and carry display metadata', () => {

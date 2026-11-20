@@ -5,6 +5,7 @@ import {
   sliceForStep, clampReport, groupTools, estimateTokens, normalizeHidden,
   planView, parseSliceCommand, mergePlanIndex, mergePlan,
   resolveHidden, normalizeScenarios, builtInScenarios, groupOfTool, scenarioOf,
+  accessHidden, normalizeAccess, patchStep,
 } from '../core.mjs'
 
 const sample = {
@@ -255,4 +256,74 @@ test('scenarioOf names the scheme the switch list currently equals', () => {
   assert.equal(scenarioOf(scenarios, ['read']), '', 'a hand-tuned list has no scenario')
   assert.equal(scenarioOf(undefined, ['read']), '')
   assert.equal(scenarioOf([], []), '')
+})
+
+test('accessHidden turns a permission profile into a concrete deny list', () => {
+  const tools = ['read', 'write', 'edit', 'apply_patch', 'glob', 'grep', 'todo_write', 'web_search', 'pwsh']
+  // 只读 keeps the readers and helpers, denies every mutator and every group.
+  assert.deepEqual(accessHidden('只读', tools), ['apply_patch', 'edit', 'pwsh', 'web_search', 'write'])
+  // 读写 keeps the filesystem group, still denies the shell and the web.
+  assert.deepEqual(accessHidden('读写', tools), ['pwsh', 'web_search'])
+  // 全量 restricts nothing, and an unknown value is treated as no restriction.
+  assert.deepEqual(accessHidden('全量', tools), [])
+  assert.deepEqual(accessHidden('', tools), [])
+  assert.deepEqual(accessHidden(undefined, tools), [])
+})
+
+test('accessHidden accepts the English aliases for a profile', () => {
+  const tools = ['read', 'write', 'web_search']
+  assert.deepEqual(accessHidden('read', tools), ['web_search', 'write'])
+  assert.deepEqual(accessHidden('edit', tools), ['web_search'])
+  assert.equal(normalizeAccess('full'), '全量')
+  assert.equal(normalizeAccess('nonsense'), '')
+})
+
+test('a plan round-trips the per-step model and permission profile', () => {
+  const markdown = renderPlan({
+    goal: '修图',
+    approvedAt: '',
+    steps: [{ n: 1, title: '盘点', task: '读脚本', access: '只读', model: 'local/Qwen3.8-9B-Q6_K', hidden: [], status: STATUS.todo }],
+  })
+  assert.match(markdown, /权限：只读/)
+  assert.match(markdown, /模型：local\/Qwen3.8-9B-Q6_K/)
+  const parsed = parsePlan(markdown)
+  assert.equal(parsed.steps[0].access, '只读')
+  assert.equal(parsed.steps[0].model, 'local/Qwen3.8-9B-Q6_K')
+  assert.equal(renderPlan(parsed), markdown, 're-rendering stays byte-identical')
+})
+
+test('patchStep keeps the profile and the granular list mutually exclusive', () => {
+  const plan = { steps: [{ n: 1, title: 't', task: 'x', access: '只读', model: '', hidden: [] }] }
+  // A granular deny list owns the step and clears the coarse label.
+  const granular = patchStep(plan, 1, { hidden: ['web_search'] }).plan
+  assert.equal(granular.steps[0].access, '')
+  assert.deepEqual(granular.steps[0].hidden, ['web_search'])
+  // Switching back to a profile drops the granular list.
+  const profiled = patchStep(granular, 1, { access: '读写' }).plan
+  assert.equal(profiled.steps[0].access, '读写')
+  assert.deepEqual(profiled.steps[0].hidden, [])
+  assert.deepEqual(patchStep(plan, 9, {}).error, '没有第 9 步')
+})
+test('planView exposes which model and permission the current step will use', () => {
+  const parsed = parsePlan(renderPlan({
+    goal: 'g',
+    steps: [
+      { n: 1, title: '盘点', task: '读', status: STATUS.todo, access: '只读', model: 'local/Qwen3.8-9B-Q6_K' },
+      { n: 2, title: '改', task: '写', status: STATUS.todo, access: '全量', model: '' },
+    ],
+  }))
+  const view = planView(parsed)
+  assert.equal(view.current.model, 'local/Qwen3.8-9B-Q6_K')
+  assert.equal(view.current.access, '只读')
+  assert.equal(view.current.status, '待办')
+  assert.equal(view.steps[1].model, '')
+  assert.deepEqual(view.steps[1].hidden, [])
+})
+test('auto and stop are their own commands', () => {
+  assert.deepEqual(parseSliceCommand('auto'), { action: 'auto' })
+  assert.deepEqual(parseSliceCommand('顺次'), { action: 'auto' })
+  assert.deepEqual(parseSliceCommand('跑完'), { action: 'auto' })
+  assert.deepEqual(parseSliceCommand('stop'), { action: 'stop' })
+  assert.deepEqual(parseSliceCommand('停止'), { action: 'stop' })
+  assert.deepEqual(parseSliceCommand('parallel'), { action: 'parallel' })
 })

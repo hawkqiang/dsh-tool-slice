@@ -14,11 +14,12 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   groupTools, estimateTokens, normalizeHidden, normalizeScenarios, resolveHidden, builtInScenarios,
-  planView, parsePlan, parseSliceCommand, clampReport,
+  planView, parsePlan, parseSliceCommand, clampReport, readySteps, isApproved,
 } from './core.mjs'
 import {
-  readPlanIndex, runStep, planStatusText, planRequestPrompt, revisePrompt, planFile, readPlanFile, ensureCwd,
-  messageOf as sliceMessage,
+  readPlanIndex, runStep, planStatusText, planRequestPrompt, revisePrompt, autoPrompt, planFile, readPlanFile, ensureCwd,
+  messageOf as sliceMessage, listModelRoutes, setApproved, approveIndexedPlan, configureIndexedStep,
+  stopSession, sessionIdOf, isRunning, stepStatsOf,
 } from './workflow.mjs'
 
 export const name = 'tool-slice'
@@ -28,6 +29,43 @@ const STATE_VERSION = 2
 const MAX_SCENARIOS = 24
 const MAX_HIDDEN = 400
 const MAX_SESSIONS = 200
+
+/**
+ * Record every declared preset's activation diagnostic beside the state file.
+ *
+ * The roster a user sees in Settings reports "加载失败" from `AgentPreset.broken`,
+ * whose text the browser only shows on hover; writing it next to the switch
+ * state makes a broken preset composition diagnosable without a debugger.
+ *
+ * The read is deferred: `agentPresets.list()` re-audits against the settled Host
+ * tree, and awaiting that inside this Host row's own activation would deadlock.
+ * Best effort throughout — a diagnostic must never break the plugin.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} statePath the switch-state file, whose directory owns the report
+ */
+function reportPresets(ctx, statePath) {
+  const timer = setTimeout(async () => {
+    try {
+      const presets = ctx.get('agentPresets')
+      if (!presets || typeof presets.list !== 'function') return
+      const rows = await presets.list()
+      const report = {
+        at: new Date().toISOString(),
+        presets: rows.map((row) => ({
+          id: row.id,
+          name: row.name ?? '',
+          broken: row.broken ?? '',
+        })),
+      }
+      const target = path.join(path.dirname(statePath), 'tool-slice-presets.json')
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    } catch {
+      /* the roster is a diagnostic, never a prerequisite */
+    }
+  }, 5000)
+  ctx.effect(() => () => clearTimeout(timer))
+}
 
 /**
  * Session id of an Agent, without assuming a particular Session shape.
@@ -47,12 +85,15 @@ function sessionOf(agent) {
  */
 export function apply(ctx) {
   const statePath = resolveStatePath()
+  reportPresets(ctx, statePath)
   let state
   try {
     state = loadState(statePath)
   } catch {
     // A malformed state file must not stop the plugin from loading.
-    state = { version: STATE_VERSION, revision: 1, hidden: [], scenarios: [], sessions: {} }
+    state = {
+      version: STATE_VERSION, revision: 1, hidden: [], scenarios: [], sessions: {}, planDefaults: { access: '', hidden: [] },
+    }
   }
   /** Canonical form of the accepted file contents, to detect hand edits. */
   let acceptedKey = canonicalKey(state)
@@ -218,6 +259,27 @@ export function apply(ctx) {
       requestBody: 'buffered',
       fetch: (request) => Promise.resolve(planSnapshot(request)),
     }))
+    // The panel is the only place a step's model and tool policy can be set:
+    // the model-facing tools deliberately accept neither, so a step runs with
+    // exactly what the human chose.
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/tool-slice/step',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => editStepRoute(request),
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/tool-slice/approve',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: (request) => approveRoute(request),
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/tool-slice/models',
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: (_request) => Promise.resolve(modelsSnapshot()),
+    }))
     // Scenarios are shared definitions, so creating or deleting one is its own
     // call: it must never be mixed into a draft save that could overwrite the
     // other conversations' switch lists.
@@ -236,11 +298,50 @@ export function apply(ctx) {
   ctx.inject(['commands'], (scope) => {
     scope.effect(() => scope.commands.register({
       name: 'slice',
-      description: '切片工作法：讨论并拆解目标、修订计划、执行下一步、查看进度',
-      input: { hint: '[plan <目标> | revise <意见> | next [步骤号] | show]' },
+      description: 'plan-act：先讨论再拆成小步计划（plan），再逐步执行（act）；可确认/取消确认、修订计划、查看进度',
+      input: { hint: '[plan <目标> | revise <意见> | approve | unapprove | next [步骤号] | show]' },
       handler: ({ agent, rawInput }) => sliceCommand(ctx, agent, rawInput),
     }))
   })
+
+  /**
+   * The preset id a Session committed to, when the registry can tell us.
+   * @param {object} agent
+   * @returns {string}
+   */
+  function presetOf(agent) {
+    try {
+      const presets = ctx.get('agentPresets')
+      const id = presets?.presetForSession?.(agent?.session)
+      return typeof id === 'string' && id !== '' ? id : '未知'
+    } catch {
+      return '未知'
+    }
+  }
+
+  /**
+   * Explain the missing tool when this Session's preset does not mount the
+   * plan-act tools.
+   *
+   * The dock is mounted profile-wide while `plan_write`/`step_run` belong to the
+   * preset, so a session on another preset shows the buttons but has nothing
+   * behind them — which reads as "I clicked and nothing happened". A hand-written
+   * `write` plan file is not our format and must not be pretended into one.
+   * @param {object} agent
+   * @returns {string | undefined} the refusal text, or undefined when usable
+   */
+  function missingPlanTools(agent) {
+    try {
+      const names = new Set(agent.ctx.tools.definitions(agent).map((definition) => definition.name))
+      const missing = ['plan_write', 'step_run'].filter((name) => !names.has(name))
+      if (missing.length === 0) return undefined
+      return `这个会话的预设是「${presetOf(agent)}」，没有 plan-act 的计划工具（缺 ${missing.join('、')}）：`
+        + '计划面板只能读计划文件、确认计划，不能替这个预设规划或执行。'
+        + '请新开一个预设选 plan-act 的会话再做这件事。'
+    } catch {
+      return undefined
+    }
+  }
 
   /**
    * One grammar, three callers: the composer, the dock buttons, and `/slice`.
@@ -252,7 +353,43 @@ export function apply(ctx) {
   async function sliceCommand(context, agent, rawInput) {
     const parsed = parseSliceCommand(rawInput)
     if (parsed.error !== undefined) return { kind: 'error', text: parsed.error }
+    if (parsed.action === 'plan' || parsed.action === 'next' || parsed.action === 'revise' || parsed.action === 'parallel' || parsed.action === 'auto') {
+      const missing = missingPlanTools(agent)
+      if (missing !== undefined) return { kind: 'error', text: missing }
+    }
     try {
+      if (parsed.action === 'auto') {
+        // Automatic sequencing is a conversation mode, not a host loop: the model
+        // keeps calling step_run, so every step's child report lands in the
+        // transcript where the user can read it, and the human gate stays intact.
+        const view = await planStatusText(context, agent)
+        let plan
+        try {
+          const cwd = await ensureCwd(context, agent, undefined)
+          plan = readPlanFile(planFile(cwd, agent))
+        } catch {
+          plan = undefined
+        }
+        if (plan === undefined) return { kind: 'error', text: '还没有计划：先让模型拆解，或点「开始规划」。' }
+        if (!isApproved(plan)) {
+          return { kind: 'error', text: '这份计划还没确认：先在面板点「确认计划」，或发送 /slice approve。' }
+        }
+        if (readySteps(plan).length === 0) {
+          return { kind: 'success', text: `没有可立即执行的步骤，未启动自动执行。${view.split('\n').slice(0, 4).join('\n')}` }
+        }
+        const followup = agent?.followup
+        if (typeof followup !== 'function') {
+          return { kind: 'error', text: '这个会话无法从指令注入消息：请直接在输入框里说“按计划顺次执行”。' }
+        }
+        await followup.call(agent, {
+          content: [{ type: 'text', text: autoPrompt(plan) }],
+          source: { kind: 'user' },
+        })
+        return {
+          kind: 'success',
+          text: '已开始自动顺次执行：模型会一步步调用 step_run，每步的报告都会出现在对话里；要停就点「停止全部」或 /slice stop。',
+        }
+      }
       if (parsed.action === 'plan' || parsed.action === 'revise') {
         // Both actions only talk: they ask the model to clarify or re-plan and
         // stop there. Starting work stays an explicit, separate decision.
@@ -274,9 +411,34 @@ export function apply(ctx) {
             : '已把修订意见交给模型：它改完计划会停下等你确认，已完成的步骤不会丢。',
         }
       }
+      if (parsed.action === 'approve' || parsed.action === 'unapprove') {
+        const approved = parsed.action === 'approve'
+        const result = await setApproved(context, agent, approved)
+        return {
+          kind: 'success',
+          text: approved
+            ? `已确认这份计划（${result.plan.steps.length} 步）：现在可以让模型执行下一步，模型自己调用 step_run 也不会再被拒绝。`
+            : `已取消确认：step_run 会重新被拒绝，直到你再确认一次。`,
+        }
+      }
       if (parsed.action === 'next') {
         const text = await runStep(context, agent, { step: parsed.step })
         return { kind: 'success', text: clampReport(text, 1600) }
+      }
+      if (parsed.action === 'parallel') {
+        // Only steps whose dependencies are satisfied start, so a parallel batch
+        // never races a step that has to wait for another one.
+        const text = await runStep(context, agent, { parallel: true })
+        return { kind: 'success', text: clampReport(text, 1600) }
+      }
+      if (parsed.action === 'stop') {
+        const stopped = stopSession(sessionIdOf(agent))
+        return {
+          kind: 'success',
+          text: stopped
+            ? '已请求停止：正在跑的步骤会标记为「已取消」，不会算完成。之后点「继续」重跑它们，或点「重新规划」。'
+            : '现在没有在执行的步骤可停止。',
+        }
       }
       return { kind: 'success', text: await planStatusText(context, agent) }
     } catch (error) {
@@ -301,6 +463,101 @@ export function apply(ctx) {
     }
   }
 
+  /** The `session` query parameter every panel route carries. */
+  function sessionParam(request) {
+    try {
+      return new URL(request?.url ?? '', 'http://localhost').searchParams.get('session') ?? ''
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * Every provider the LLM runtime serves, with the models it advertises: the
+   * panel's model picker is built from this, never from a hard-coded list.
+   * @returns {Promise<Response>}
+   */
+  async function modelsSnapshot() {
+    const headers = { 'cache-control': 'no-store' }
+    try {
+      return Response.json({ ok: true, routes: await listModelRoutes(ctx) }, { headers })
+    } catch (error) {
+      return Response.json({ ok: false, error: sliceMessage(error), routes: [] }, { headers })
+    }
+  }
+
+  /**
+   * Confirm or withdraw the plan from the panel. No Agent is involved: the
+   * index the plan tools maintain resolves the file, so this works with the
+   * page open and no model running.
+   * @param {Request} request
+   * @returns {Promise<Response>}
+   */
+  async function approveRoute(request) {
+    const headers = { 'cache-control': 'no-store' }
+    const sessionId = sessionParam(request)
+    if (sessionId === '') return Response.json({ ok: false, error: '缺少会话 ID' }, { status: 400, headers })
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return Response.json({ ok: false, error: '请求格式错误' }, { status: 400, headers })
+    }
+    if (body === null || typeof body !== 'object') {
+      return Response.json({ ok: false, error: '请求格式错误' }, { status: 400, headers })
+    }
+    try {
+      const { plan, file } = approveIndexedPlan(sessionId, body.approved !== false)
+      return Response.json({ ok: true, plan: planView(plan, { file }), file }, { headers })
+    } catch (error) {
+      return Response.json({ ok: false, error: sliceMessage(error) }, { status: 400, headers })
+    }
+  }
+
+  /**
+   * Write one step's model and/or tool policy from the panel.
+   * @param {Request} request
+   * @returns {Promise<Response>}
+   */
+  async function editStepRoute(request) {
+    const headers = { 'cache-control': 'no-store' }
+    const sessionId = sessionParam(request)
+    if (sessionId === '') return Response.json({ ok: false, error: '缺少会话 ID' }, { status: 400, headers })
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      return Response.json({ ok: false, error: '请求格式错误' }, { status: 400, headers })
+    }
+    if (body === null || typeof body !== 'object') {
+      return Response.json({ ok: false, error: '请求格式错误' }, { status: 400, headers })
+    }
+    const step = Number(body.step)
+    if (!Number.isInteger(step) || step < 1) {
+      return Response.json({ ok: false, error: '步骤号无效' }, { status: 400, headers })
+    }
+    try {
+      const { plan, file } = configureIndexedStep(sessionId, {
+        step,
+        ...(body.model === undefined ? {} : { model: String(body.model) }),
+        ...(body.hidden === undefined ? {} : { hidden: Array.isArray(body.hidden) ? body.hidden.map(String) : [] }),
+        ...(body.access === undefined ? {} : { access: String(body.access) }),
+      })
+      return Response.json({
+        ok: true,
+        plan: planView(plan, {
+          file,
+          running: isRunning(sessionId),
+          stats: stepStatsOf(sessionId),
+          defaults: state.planDefaults,
+        }),
+        file,
+      }, { headers })
+    } catch (error) {
+      return Response.json({ ok: false, error: sliceMessage(error) }, { status: 400, headers })
+    }
+  }
+
   /**
    * The dock's read-only view of one session's plan, resolved through the index
    * `plan_write`/`step_run` maintain. No Agent is needed, so the page keeps
@@ -310,12 +567,7 @@ export function apply(ctx) {
    */
   function planSnapshot(request) {
     const headers = { 'cache-control': 'no-store' }
-    let sessionId = ''
-    try {
-      sessionId = new URL(request.url, 'http://localhost').searchParams.get('session') ?? ''
-    } catch {
-      sessionId = ''
-    }
+    const sessionId = sessionParam(request)
     const entry = readPlanIndex().sessions[String(sessionId)]
     if (entry === undefined || typeof entry.file !== 'string') {
       return Response.json({ ok: true, plan: null, reason: 'no-plan' }, { headers })
@@ -334,7 +586,13 @@ export function apply(ctx) {
     }
     return Response.json({
       ok: true,
-      plan: planView(parsed, { file: entry.file, updatedAt: entry.updatedAt ?? '' }),
+      plan: planView(parsed, {
+        file: entry.file,
+        updatedAt: entry.updatedAt ?? '',
+        running: isRunning(sessionId),
+        stats: stepStatsOf(sessionId),
+        defaults: state.planDefaults,
+      }),
     }, { headers })
   }
 
@@ -452,7 +710,11 @@ export function apply(ctx) {
     const knownSet = known.size > 0 ? known : undefined
     const nextHidden = normalizeHidden(body.hidden, knownSet).slice(0, MAX_HIDDEN)
     try {
-      if (sessionId !== '') {
+      if (body.defaults === true) {
+        // The step default is profile-wide, so it is never mixed with a session
+        // save: a "save this conversation" click must not change every plan.
+        state.planDefaults = normalizePlanDefaults({ access: body.access, hidden: nextHidden })
+      } else if (sessionId !== '') {
         if (body.followGlobal === true) {
           delete state.sessions[sessionId]
         } else {
@@ -477,7 +739,9 @@ export function apply(ctx) {
  * @param {string} statePath
  */
 function loadState(statePath) {
-  const fallback = { version: STATE_VERSION, revision: 1, hidden: [], scenarios: [], sessions: {} }
+  const fallback = {
+    version: STATE_VERSION, revision: 1, hidden: [], scenarios: [], sessions: {}, planDefaults: { access: '', hidden: [] },
+  }
   let raw
   try {
     raw = fs.readFileSync(statePath, 'utf8')
@@ -492,7 +756,39 @@ function loadState(statePath) {
     // `sets` is the pre-0.3 name for what the UI now calls scenarios.
     scenarios: normalizeScenarios(parsed?.scenarios ?? parsed?.sets, undefined, MAX_SCENARIOS),
     sessions: normalizeSessions(parsed?.sessions),
+    // What a step gets when the planner leaves the model/permission fields empty.
+    planDefaults: normalizePlanDefaults(parsed?.planDefaults),
   }
+}
+
+/**
+ * The default permission policy a planned step starts from.
+ *
+ * Keeping this in the profile state (not per plan) is what makes "every step of
+ * every plan should be read-only unless I say otherwise" a single setting.
+ * @param {unknown} value
+ * @returns {{access: string, hidden: string[]}}
+ */
+function normalizePlanDefaults(value) {
+  const access = typeof value?.access === 'string' ? normalizeAccessText(value.access) : ''
+  return {
+    access,
+    hidden: access === '' ? normalizeHidden(value?.hidden, undefined) : [],
+  }
+}
+
+/**
+ * Normalize one access word, accepting both languages the way the client sends
+ * it. Kept here because index.js must not import the preset-side module graph.
+ * @param {string} value
+ * @returns {string}
+ */
+function normalizeAccessText(value) {
+  const text = String(value ?? '').trim()
+  if (text === '只读' || text === 'read') return '只读'
+  if (text === '读写' || text === 'edit') return '读写'
+  if (text === '全量' || text === 'full') return '全量'
+  return ''
 }
 
 /**
@@ -542,6 +838,7 @@ function canonicalKey(state) {
     hidden: [...state.hidden].sort(),
     scenarios: state.scenarios,
     sessions: Object.fromEntries(Object.entries(state.sessions).sort((a, b) => a[0].localeCompare(b[0]))),
+    planDefaults: state.planDefaults,
   })
 }
 

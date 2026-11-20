@@ -87,6 +87,24 @@ window.__ModuleLoader__.load({
 .tsd-step-n{font-variant-numeric:tabular-nums;opacity:.7;min-width:1.4em}
 .tsd-step-title{flex:1 1 auto}
 .tsd-step-status{font-size:11px;opacity:.7;white-space:nowrap}
+.tsd-step{flex-wrap:wrap}
+.tsd-step-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;width:100%;padding-left:1.6em}
+.tsd-step-controls .tsl-select{flex:1 1 160px;font-size:12px;padding:3px 6px}
+.tsd-step-controls .tsl-button{font-size:12px;padding:3px 9px}
+.tsd-tools{width:100%;margin:6px 0 10px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l3,#8885);border-radius:10px}
+.tsd-tools .tsl-groups{max-height:240px;overflow:auto}
+.tsd-tools .tsl-group{padding:6px 8px}
+.tsd-pill-warn{border-color:var(--dsw-alias-state-warning-primary,#d09a2d);color:var(--dsw-alias-state-warning-primary,#d09a2d)}
+.tsd-pill-access{font-size:11px;padding:2px 8px;white-space:nowrap}
+.tsd-status-todo{color:var(--dsw-alias-text-secondary,#8a8f98)}
+.tsd-status-doing{color:var(--dsw-alias-state-info-primary,#3b82f6)}
+.tsd-status-done{color:var(--dsw-alias-state-success-primary,#2e9e5b)}
+.tsd-status-failed{color:var(--dsw-alias-state-error-primary,#d4544a)}
+.tsd-status-cancelled{color:var(--dsw-alias-state-warning-primary,#d09a2d)}
+.tsd-dep{font-size:11px;opacity:.7}
+.tsd-stat{font-size:11px;opacity:.75;font-variant-numeric:tabular-nums}
+.tsd-danger{color:var(--dsw-alias-state-error-primary,#d4544a)}
+.tsd-unified{margin:6px 0 8px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l3,#8884);border-radius:8px;background:var(--dsw-alias-bg-module-platform,#1f2023)}
 .tsd-textarea{font:inherit;color:inherit;background:transparent;border:1px solid var(--dsw-alias-border-l3,#8885);border-radius:9px;padding:8px 10px;width:100%;min-height:54px;resize:vertical}
 .tsd-textarea:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#3478f6);outline-offset:2px}
 .tsd-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
@@ -537,7 +555,7 @@ window.__ModuleLoader__.load({
     }
 
     function summaryText() {
-      return '按需关闭工具定义，节省每次请求的工具定义 token；把任务拆成计划后逐步交给子代理执行。'
+      return '按需关闭工具定义，节省每次请求的工具定义 token；plan-act：先把任务拆成小步计划，再逐步交给子代理执行。'
     }
 
     function readOpen() {
@@ -558,11 +576,125 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function stepRow(step) {
+    function chipModel(step) {
+      const model = String(step?.model ?? '')
+      if (model === '') return '继承'
+      const short = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model
+      return short.length > 16 ? `${short.slice(0, 15)}…` : short
+    }
+
+    function statusKey(status) {
+      return ({ 待办: 'todo', 进行中: 'doing', 完成: 'done', 失败: 'failed', 已取消: 'cancelled' })[status] ?? 'todo'
+    }
+
+    /**
+     * The deny list a permission profile means, for the tools this profile mounts.
+     *
+     * Mirrors `accessHidden` in core.mjs: the panel must show the same boxes the
+     * child will really be missing, otherwise "只读" looks like "全部".
+     * @param {string} access
+     * @param {string[]} names every mounted tool name
+     * @returns {string[]}
+     */
+    function denyForAccess(access, names) {
+      if (access === '' || access === '全量') return []
+      const keep = new Set(['read', 'glob', 'grep', 'ls'])
+      const safeGroup = new Set(['fs_search', 'todo', 'ask', 'plan', 'step', 'jobs'])
+      return names.filter((name) => {
+        const group = name.split('_')[0]
+        if (safeGroup.has(group)) return false
+        if (access === '只读') return !keep.has(name)
+        if (access === '读写') return !keep.has(name) && name !== 'write' && name !== 'edit' && name !== 'apply_patch'
+        return false
+      })
+    }
+
+    /** `工具 只读` / `工具 −3` / `工具 全部`: what the step really allows. */
+    function toolLabel(step) {
+      if (step.hidden.length > 0) return `工具 −${step.hidden.length}`
+      if (step.access !== '') return `工具 ${step.access}`
+      return '工具 全部'
+    }
+
+    /** `输出 1,234 tok · 12.3 tok/s · 1分40秒` for one step. */
+    function formatStats(stat) {
+      if (stat === undefined || stat === null || stat.calls === 0) return ''
+      const seconds = Math.round(stat.ms / 1000)
+      const span = seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+      const tokens = stat.output >= 1000 ? `${(stat.output / 1000).toFixed(1)}k` : String(stat.output)
+      return `输出 ${tokens} tok · ${stat.tps} tok/s · ${span}`
+    }
+
+    function stepRow(step, panel) {
+      const routeValue = step.model === '' ? '' : step.model
+      const known = panel.models.some((route) => route.models.some((model) => `${route.provider}/${model.id}` === routeValue))
+      const options = [
+        h('option', { value: '', key: 'inherit' }, '继承父会话'),
+        ...panel.models.map((route) => h('optgroup', { label: route.name, key: `p-${route.provider}` },
+          route.models.map((model) => h('option', { value: `${route.provider}/${model.id}`, key: `${route.provider}/${model.id}` },
+            model.name)))),
+        routeValue !== '' && !known
+          ? h('option', { value: routeValue, key: 'current' }, `${routeValue}（不在当前列表）`)
+          : null,
+      ]
+      const hidden = panel.toolDraft !== null && panel.toolDraft.step === step.n ? panel.toolDraft.hidden : null
       return h('li', { className: 'tsd-step', key: step.n, 'data-status': step.status },
         h('span', { className: 'tsd-step-n' }, step.n),
+        h('span', {
+          className: `tsd-step-status tsd-status-${statusKey(step.status)}`,
+          title: step.status === '进行中' && step.startedAt !== '' ? `起于 ${step.startedAt}` : '',
+        }, step.status),
         h('span', { className: 'tsd-step-title', title: step.task }, step.title),
-        h('span', { className: 'tsd-step-status' }, step.status))
+        step.dependsOn.length === 0
+          ? null
+          : h('span', {
+              className: 'tsd-dep',
+              title: `要等第 ${step.dependsOn.join('、')} 步完成才能开始`,
+            }, `依赖 ${step.dependsOn.join(',')}`),
+        formatStats(panel.stats?.[String(step.n)]) === ''
+          ? null
+          : h('span', { className: 'tsd-stat', title: '这一步子代理的 token 用量、速度与耗时' },
+              formatStats(panel.stats[String(step.n)])),
+        h('div', { className: 'tsd-step-controls' },
+          h('span', {
+            className: `tsl-pill${step.access === '' ? '' : ' tsd-pill-access'}`,
+            title: step.access === ''
+              ? (step.hidden.length > 0 ? `自定义：关闭 ${step.hidden.length} 个工具` : '全量：不限制工具')
+              : `规划时给定的权限：${step.access}`,
+          }, step.access === '' ? (step.hidden.length > 0 ? `自定义 −${step.hidden.length}` : '全量') : step.access),
+          h('select', {
+            className: 'tsl-select',
+            value: routeValue,
+            disabled: panel.busy,
+            title: '这一步用哪个模型执行',
+            onChange: (event) => { void panel.writeStep(step.n, { model: event.target.value }) },
+          }, options),
+          h('button', {
+            type: 'button',
+            className: 'tsl-button',
+            disabled: panel.busy,
+            title: '这一步允许调用哪些工具',
+            onClick: () => panel.toggleTools(step.n),
+          }, toolLabel(step))),
+        hidden === null ? null : h('div', { className: 'tsd-tools' },
+          h('p', { className: 'tsd-note', style: { marginTop: 0 } },
+            `第 ${step.n} 步可用工具（取消勾选＝这一步禁用该工具）：`),
+          ...(panel.groups.length === 0
+            ? [h('p', { className: 'tsd-note' }, '还没有工具清单：先在任意会话里跑一步，再回来。')]
+            : panel.groups.map(panel.checklist(hidden, (next) => panel.setDraftHidden(step.n, next)))),
+          h('div', { className: 'tsd-actions' },
+            h('button', {
+              type: 'button',
+              className: 'tsl-button tsl-button-primary',
+              disabled: panel.busy,
+              onClick: () => { void panel.saveTools(step.n) },
+            }, '保存这步的工具'),
+            h('button', { type: 'button', className: 'tsl-button', onClick: () => panel.toggleTools(step.n) }, '收起'),
+            h('button', {
+              type: 'button',
+              className: 'tsl-button',
+              onClick: () => panel.setToolDraft(step.n, new Set()),
+            }, '全部启用'))))
     }
 
     /**
@@ -581,8 +713,17 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = useState('')
       const [goal, setGoal] = useState('')
       const [feedback, setFeedback] = useState('')
-      const [showSteps, setShowSteps] = useState(false)
+      const [showSteps, setShowSteps] = useState(true)
       const [spaceAbove, setSpaceAbove] = useState(420)
+      const [models, setModels] = useState([])
+      const [toolDraft, setToolDraftState] = useState(null)
+      // The unified settings at the top of the panel: a permission profile plus a
+      // tool checklist that can be saved as the default and pushed to every
+      // unfinished step in one click.
+      const [unified, setUnified] = useState(null)
+      const [unifiedOpen, setUnifiedOpen] = useState(false)
+      const [unifiedCollapsed, setUnifiedCollapsed] = useState(false)
+      const [stepError, setStepError] = useState('')
       const rootRef = useRef(null)
       const pollRef = useRef(null)
       const aliveRef = useRef(true)
@@ -653,13 +794,14 @@ window.__ModuleLoader__.load({
         return () => { controller.abort() }
       }, [open, loadPlan])
 
-      // While a step is running, keep the progress line current; the plan file
-      // is written before the child starts and when its report lands.
+      // While a step is running, keep the progress line current; the plan file is
+      // written before the child starts and when its report lands. The `running`
+      // flag comes from the Host, so a run started from the transcript also polls.
       useEffect(() => {
-        if (open !== 'plan' || !busy) return undefined
+        if (open !== 'plan' || !(busy || (plan !== null && plan !== undefined && plan.running === true))) return undefined
         const timer = setInterval(() => { loadPlan() }, 2500)
         return () => { clearInterval(timer) }
-      }, [open, busy, loadPlan])
+      }, [open, busy, plan, loadPlan])
 
       async function exec(line) {
         if (typeof run !== 'function') {
@@ -694,6 +836,9 @@ window.__ModuleLoader__.load({
 
       async function nextStep() {
         if (busy) return
+        // Open the panel before starting: the run's narration appears there, and a
+        // user who clicked "execute" wants to watch it.
+        if (open !== 'plan') { writeOpen('plan'); setOpen('plan') }
         setBusy(true)
         try {
           const ok = await exec('/slice next')
@@ -703,6 +848,49 @@ window.__ModuleLoader__.load({
             setBusy(false)
             loadPlan()
           }
+        }
+      }
+
+      /** Start every step whose dependencies are satisfied, side by side. */
+      async function runParallel() {
+        if (busy) return
+        if (open !== 'plan') { writeOpen('plan'); setOpen('plan') }
+        setBusy(true)
+        try {
+          await exec('/slice parallel')
+        } finally {
+          if (aliveRef.current) {
+            setBusy(false)
+            loadPlan()
+          }
+        }
+      }
+
+      /** Ask the model to run every remaining step in order, without stopping. */
+      async function autoRun() {
+        if (busy) return
+        if (open !== 'plan') { writeOpen('plan'); setOpen('plan') }
+        setBusy(true)
+        try {
+          await exec('/slice auto')
+        } finally {
+          if (aliveRef.current) {
+            setBusy(false)
+            loadPlan()
+          }
+        }
+      }
+
+      /**
+       * Cancel the steps in flight. This aborts this session's plan run only, so
+       * the model's turn keeps going and can still report what it saw.
+       */
+      async function stopAll() {
+        setStatus('正在停止…')
+        try {
+          await exec('/slice stop')
+        } finally {
+          if (aliveRef.current) loadPlan()
         }
       }
 
@@ -749,7 +937,11 @@ window.__ModuleLoader__.load({
             h('span', { className: 'tsd-dot', 'aria-hidden': true }),
             '计划 ',
             h('b', null, `${plan.done}/${plan.total}`),
-            plan.current === null ? ' ·已完成' : ` ·第 ${plan.current.n} 步`)
+            plan.approved
+              ? (plan.current === null
+                  ? ' ·已完成'
+                  : ` ·第 ${plan.current.n} 步${plan.current.status === '进行中' ? ' 进行中' : ''} ·${chipModel(plan.current)}`)
+              : ' ·待确认')
 
       const toolChip = h('button', {
         type: 'button',
@@ -802,6 +994,181 @@ window.__ModuleLoader__.load({
               h('span', { className: 'tsl-status' }, slice.saving ? '保存中…' : slice.notice)))
         : null
 
+      // The model picker: every provider the LLM runtime serves. Fetched once
+      // while the plan panel is open; a failure just leaves "inherit" available.
+      useEffect(() => {
+        if (open !== 'plan' || models.length > 0) return undefined
+        const controller = new AbortController()
+        fetch(`${ENDPOINT}/models`, { credentials: 'same-origin', signal: controller.signal })
+          .then((response) => response.json())
+          .then((data) => setModels(Array.isArray(data?.routes) ? data.routes : []))
+          .catch(() => { /* the picker still offers "inherit" */ })
+        return () => { controller.abort() }
+      }, [open, models.length])
+
+      const planSuffix = `?session=${encodeURIComponent(sessionId)}`
+
+      /**
+       * Write one step's model or tool policy. The whole plan comes back, so the
+       * panel never merges a partial response and never guesses.
+       * @param {number} step
+       * @param {{model?: string, hidden?: string[]}} patch
+       * @returns {Promise<boolean>}
+       */
+      const writeStep = useCallback(async (step, patch) => {
+        if (sessionId === '') return false
+        setStepError('')
+        try {
+          const data = await request(`/step${planSuffix}`, {
+            method: 'POST',
+            body: JSON.stringify({ step, ...patch }),
+          })
+          setPlan(data.plan)
+          return true
+        } catch (cause) {
+          setStepError(`保存第 ${step} 步失败：${cause?.message ?? cause}`)
+          return false
+        }
+      }, [planSuffix, sessionId])
+
+      /** Confirm or withdraw the gate the model-facing step_run checks. */
+      const setApproval = useCallback(async (approved) => {
+        if (sessionId === '') return
+        setStepError('')
+        try {
+          const data = await request(`/approve${planSuffix}`, {
+            method: 'POST',
+            body: JSON.stringify({ approved }),
+          })
+          setPlan(data.plan)
+          setStatus(approved
+            ? '已确认：这一步的模型和工具就按当前设定执行。'
+            : '已取消确认：模型调用 step_run 会被拒绝，直到你再确认。')
+        } catch (cause) {
+          setStepError(`确认失败：${cause?.message ?? cause}`)
+        }
+      }, [planSuffix, sessionId])
+
+      const setToolDraft = useCallback((step, hidden) => {
+        setToolDraftState({ step, hidden: new Set(hidden) })
+      }, [])
+
+      /** Save the unified block as this profile's default step policy. */
+      async function saveUnifiedAsDefault() {
+        if (unified === null || sessionId === '') return
+        const granular = unified.access === '' && unified.hidden.size > 0
+        try {
+          await request('/save', {
+            method: 'POST',
+            body: JSON.stringify({
+              defaults: true,
+              access: granular ? '' : unified.access,
+              hidden: granular ? [...unified.hidden].sort() : [],
+            }),
+          })
+          setStatus(granular
+            ? `已设为默认：以后新建的步骤会关闭这 ${unified.hidden.size} 个工具。`
+            : `已设为默认：以后新建的步骤按「${unified.access === '' ? '全量' : unified.access}」开始。`)
+          loadPlan()
+        } catch (cause) {
+          setStepError(`保存默认设置失败：${cause?.message ?? cause}`)
+        }
+      }
+
+      /** Push the unified block onto every step that is not finished yet. */
+      async function applyUnifiedToAll() {
+        if (unified === null || plan === null || plan === undefined || busy) return
+        const granular = unified.access === '' && unified.hidden.size > 0
+        const patch = granular
+          ? { access: '', hidden: [...unified.hidden].sort() }
+          : { access: unified.access, hidden: [] }
+        // Finished steps keep their record and their policy; only pending work
+        // is retargeted.
+        const targets = plan.steps.filter((step) => step.status !== '完成')
+        setBusy(true)
+        setStepError('')
+        try {
+          for (const step of targets) await writeStep(step.n, patch)
+          if (aliveRef.current) {
+            setStatus(`已把统一设置应用到 ${targets.length} 个未完成步骤。`)
+            loadPlan()
+          }
+        } finally {
+          if (aliveRef.current) setBusy(false)
+        }
+      }
+
+      /** Open or close one step's tool checklist. */
+      const toggleTools = useCallback((step) => {
+        setStepError('')
+        setToolDraftState((draft) => {
+          if (draft !== null && draft.step === step) return null
+          const target = plan?.steps?.find((item) => item.n === step)
+          const names = (slice.data?.groups ?? []).flatMap((group) => group.tools.map((tool) => tool.name))
+          // A step that only carries a profile shows the boxes that profile really
+          // denies; otherwise "应用了只读" would still look like everything is on.
+          const seed = target !== undefined && target.hidden.length > 0
+            ? target.hidden
+            : denyForAccess(String(target?.access ?? ''), names)
+          return { step, hidden: new Set(seed) }
+        })
+      }, [plan, slice.data])
+
+      const saveTools = useCallback(async (step) => {
+        const draft = toolDraft
+        if (draft === null || draft.step !== step) return
+        const ok = await writeStep(step, { hidden: [...draft.hidden].sort() })
+        if (ok) setToolDraftState(null)
+      }, [toolDraft, writeStep])
+
+      /**
+       * Build a checkbox renderer bound to one deny set: the step draft and the
+       * unified block share it, so a tool means the same thing in both places.
+       * @param {Set<string>} hidden denied tool names
+       * @param {(next: Set<string>) => void} update
+       */
+      const renderChecklist = useCallback((hidden, update) => (group) => renderGroup({
+        hidden,
+        toggle: (name, on) => {
+          const next = new Set(hidden)
+          if (on) next.delete(name)
+          else next.add(name)
+          update(next)
+        },
+        toggleGroup: (target, on) => {
+          const next = new Set(hidden)
+          for (const tool of target.tools) {
+            if (on) next.delete(tool.name)
+            else next.add(tool.name)
+          }
+          update(next)
+        },
+      }, group), [])
+
+      const stepPanel = {
+        busy,
+        models,
+        groups: slice.data?.groups ?? [],
+        stats: plan?.stats ?? {},
+        toolDraft,
+        writeStep,
+        toggleTools,
+        saveTools,
+        setToolDraft,
+        checklist: renderChecklist,
+        setDraftHidden: (step, next) => {
+          setToolDraftState((draft) => (draft !== null && draft.step === step ? { ...draft, hidden: next } : draft))
+        },
+      }
+
+      // Seed the unified block from the profile default the first time a plan loads.
+      useEffect(() => {
+        if (unified !== null) return
+        const defaults = plan?.defaults
+        if (defaults === undefined) return
+        setUnified({ access: String(defaults.access ?? ''), hidden: new Set(defaults.hidden ?? []) })
+      }, [plan, unified])
+
       const planBody = plan === null || plan === undefined
         ? h('div', null,
             h('p', { className: 'tsd-note', style: { marginTop: 0 } },
@@ -826,25 +1193,138 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'tsl-button', onClick: () => loadPlan() }, '刷新')))
         : h('div', null,
             h('p', { className: 'tsd-goal' }, plan.goal || '（计划没有写目标）'),
+            // One place to set the policy for the whole plan: the default for new
+            // steps, and a single click to push it onto every unfinished step.
+            unified === null ? null : unifiedCollapsed
+              ? h('p', { className: 'tsd-note' },
+                  h('button', {
+                    type: 'button',
+                    className: 'tsl-button',
+                    style: { marginRight: '8px' },
+                    onClick: () => setUnifiedCollapsed(false),
+                  }, '展开统一步骤设置'),
+                  `当前统一设置：${unified.access === '' ? '全量' : unified.access}${unified.hidden.size > 0 ? ` · 关闭 ${unified.hidden.size} 个工具` : ''}`)
+              : h('div', { className: 'tsd-unified' },
+              h('p', { className: 'tsd-note', style: { marginTop: 0 } },
+                '统一步骤设置（默认权限 / 统一应用到全部步骤）'),
+              h('div', { className: 'tsd-actions' },
+                h('select', {
+                  className: 'tsl-select',
+                  value: unified.access,
+                  title: '统一设置：每一步默认给多少权限',
+                  onChange: (event) => setUnified({ ...unified, access: event.target.value }),
+                },
+                  h('option', { value: '全量' }, '全量（默认）'),
+                  h('option', { value: '只读' }, '只读'),
+                  h('option', { value: '读写' }, '读写')),
+                h('button', {
+                  type: 'button',
+                  className: 'tsl-button',
+                  title: '统一设置里逐项勾选要禁用的工具',
+                  onClick: () => setUnifiedOpen(!unifiedOpen),
+                }, unified.hidden.size > 0 ? `工具 −${unified.hidden.size}` : '工具 全部'),
+                h('button', {
+                  type: 'button',
+                  className: 'tsl-button tsl-button-primary',
+                  disabled: busy || plan.steps.filter((step) => step.status !== '完成').length === 0,
+                  title: '把这套权限/工具设置写到每个未完成步骤上（已完成的步骤不动）',
+                  onClick: () => { void applyUnifiedToAll() },
+                }, '应用到全部步骤'),
+                h('button', {
+                  type: 'button',
+                  className: 'tsl-button',
+                  disabled: sessionId === '',
+                  title: '保存成这个 profile 的默认值：以后 plan_write 新建的步骤都从这里开始',
+                  onClick: () => { void saveUnifiedAsDefault() },
+                }, '设为默认'),
+                h('button', {
+                  type: 'button',
+                  className: 'tsl-button',
+                  title: '收起这块统一设置',
+                  onClick: () => { setUnifiedOpen(false); setUnifiedCollapsed(true) },
+                }, '收起')),
+              unifiedOpen
+                ? h('div', { className: 'tsd-tools' },
+                    ...(stepPanel.groups.length === 0
+                      ? [h('p', { className: 'tsd-note' }, '还没有工具清单：先在任意会话里跑一步，再回来。')]
+                      : stepPanel.groups.map(stepPanel.checklist(unified.hidden, (next) => setUnified({ ...unified, hidden: next })))),
+                    h('div', { className: 'tsd-actions' },
+                      h('button', { type: 'button', className: 'tsl-button', onClick: () => setUnifiedOpen(false) }, '收起'),
+                      h('button', { type: 'button', className: 'tsl-button', onClick: () => setUnified({ access: '', hidden: new Set() }) }, '全部启用')))
+                : null),
             h('p', { className: 'tsd-current' },
               `${plan.progress}${plan.revision > 1 ? ` · 第 ${plan.revision} 版` : ''}${plan.failed > 0 ? ` · 失败 ${plan.failed}` : ''}`,
-              plan.current === null ? '' : `\n下一步：第 ${plan.current.n} 步 ${plan.current.title}`,
-              plan.current === null || plan.current.task === '' ? '' : `\n做什么：${plan.current.task}`),
+              plan.current === null ? '' : `\n${plan.current.status === '进行中' ? '正在执行' : '下一步'}：第 ${plan.current.n} 步 ${plan.current.title}`
+                + `（模型 ${plan.current.model === '' ? '继承父会话' : plan.current.model} · 权限 ${plan.current.access === '' ? (plan.current.hidden.length > 0 ? `自定义 −${plan.current.hidden.length}` : '全量') : plan.current.access}）`,
+              plan.current === null ? '' : `\n` + (plan.current.status === '进行中' && plan.current.startedAt !== ''
+                ? `起于 ${plan.current.startedAt}；如果这轮已经结束，点「重跑」继续。`
+                : `做什么：${plan.current.task}`)),
+            // The gate: nothing runs until this line is confirmed. Every step's
+            // model and tool policy is set below, before confirming.
+            h('div', { className: 'tsd-actions' },
+              h('span', {
+                className: `tsl-pill${plan.approved ? '' : ' tsd-pill-warn'}`,
+                title: plan.approved ? `确认于 ${plan.approvedAt}` : '未确认：模型调用 step_run 会被拒绝',
+              }, plan.approved ? `已确认 ${plan.approvedAt}` : '未确认'),
+              plan.approved
+                ? h('button', { type: 'button', className: 'tsl-button', disabled: busy, onClick: () => { void setApproval(false) } }, '取消确认')
+                : h('button', {
+                    type: 'button',
+                    className: 'tsl-button tsl-button-primary',
+                    disabled: busy || sessionId === '',
+                    onClick: () => { void setApproval(true) },
+                  }, '确认计划')),
             h('div', { className: 'tsd-actions' },
               h('button', {
                 type: 'button',
                 className: 'tsl-button tsl-button-primary',
-                disabled: busy || plan.current === null,
+                disabled: busy || plan.current === null || !plan.approved,
+                title: plan.approved ? '执行下一个未完成步骤' : '先点「确认计划」',
                 onClick: () => { void nextStep() },
-              }, busy ? '执行中…' : '执行下一步'),
+              }, busy
+                ? '执行中…'
+                : (plan.current !== null && plan.current.status !== '待办' ? `重跑第 ${plan.current.n} 步` : '执行下一步')),
+              // Automatic sequencing: after confirming, this is the one-click "run the rest".
+              plan.approved && plan.ready > 0
+                ? h('button', {
+                    type: 'button',
+                    className: 'tsl-button tsl-button-primary',
+                    disabled: busy,
+                    title: '让模型按顺序把剩下的步骤一次跑完，每步的报告仍会出现在对话里',
+                    onClick: () => { void autoRun() },
+                  }, busy ? '执行中…' : `自动顺次跑完剩余 ${plan.ready} 步`)
+                : null,
+              // Parallel work needs the human's say-so: the plan only marks which
+              // steps are independent, and this button is that confirmation.
+              plan.ready >= 2
+                ? h('button', {
+                    type: 'button',
+                    className: 'tsl-button',
+                    disabled: busy || !plan.approved,
+                    title: `第 ${plan.readySteps.join('、')} 步互不依赖，可以同时跑`,
+                    onClick: () => { void runParallel() },
+                  }, `并行执行就绪 ${plan.ready} 步`)
+                : null,
+              plan.running || (plan.current !== null && plan.current.status === '进行中')
+                ? h('button', {
+                    type: 'button',
+                    className: 'tsl-button tsd-danger',
+                    title: '取消正在跑的步骤（标记为「已取消」，不算完成）',
+                    onClick: () => { void stopAll() },
+                  }, '停止全部')
+                : null,
               h('button', { type: 'button', className: 'tsl-button', onClick: () => loadPlan() }, '刷新'),
               h('button', { type: 'button', className: 'tsl-button', onClick: () => setShowSteps(!showSteps) },
-                showSteps ? '收起步骤' : `看全部 ${plan.total} 步`),
+                showSteps ? '收起每一步' : `展开 ${plan.total} 步（模型/权限）`),
               h('button', { type: 'button', className: 'tsl-button', onClick: () => setPlan(undefined) }, '新建计划')),
-            showSteps ? h('ol', { className: 'tsd-steps' }, plan.steps.map(stepRow)) : null,
+            showSteps
+              ? h('ol', { className: 'tsd-steps' }, plan.steps.map((step) => stepRow(step, stepPanel)))
+              : h('p', { className: 'tsd-note' },
+                  `共 ${plan.total} 步，点上面「展开」看每一步用哪个模型、哪些工具。`),
+            stepError !== '' ? h('p', { className: 'tsd-error' }, stepError) : null,
             h('div', { style: { marginTop: 12, borderTop: '1px solid var(--dsw-alias-border-l3,#8884)', paddingTop: 10 } },
               h('p', { className: 'tsd-note', style: { marginTop: 0 } },
-                '改计划就写在这里：模型会按你的意见重写整份计划，已完成的步骤和报告自动保留。'),
+                '改计划就写在这里：模型会按你的意见重写整份计划，已完成的步骤、报告，以及你为各步设的模型/工具都会保留；改完需要重新确认。'),
               h('textarea', {
                 className: 'tsd-textarea',
                 value: feedback,
@@ -863,7 +1343,7 @@ window.__ModuleLoader__.load({
       const planPanel = open === 'plan'
         ? h('div', { className: 'tsd-pop', style: { maxHeight: `${spaceAbove}px` } },
             h('div', { className: 'tsd-pop-head' },
-              h('span', { className: 'tsd-pop-title' }, '切片计划'),
+              h('span', { className: 'tsd-pop-title' }, 'plan-act 计划'),
               h('button', { type: 'button', className: 'tsd-close', onClick: () => togglePanel(''), 'aria-label': '收起' }, '×')),
             h('div', { className: 'tsd-pop-body' },
               planBody,

@@ -10,26 +10,61 @@ export const STATUS = Object.freeze({
   doing: '进行中',
   done: '完成',
   failed: '失败',
+  cancelled: '已取消',
 })
 
-const STEP_HEADING = /^### (\d+)\.\s+(.+?)\s+——\s+(待办|进行中|完成|失败)\s*$/
-const RECORD_HEADING = /^### 步骤 (\d+)\s+——\s+(待办|进行中|完成|失败)\s*$/
+/** Statuses a step can be started from. */
+const RUNNABLE = new Set([STATUS.todo, STATUS.cancelled, STATUS.failed])
+
+const STEP_HEADING = /^### (\d+)\.\s+(.+?)\s+——\s+(待办|进行中|完成|失败|已取消)\s*$/
+const RECORD_HEADING = /^### 步骤 (\d+)\s+——\s+(待办|进行中|完成|失败|已取消)\s*$/
 const GOAL_LINE = /^#\s*任务[：:]\s*(.*)$/
+/** Header value that means "the human has not confirmed this revision yet". */
+export const NOT_APPROVED = '未确认'
+
+/**
+ * The permission profiles a plan can assign to one step. A profile is a coarse
+ * intent the planner can reason about; the concrete deny list is derived at run
+ * time from the tools the child actually mounts.
+ */
+export const ACCESS_PROFILES = Object.freeze([
+  { id: '只读', note: '只能看：read / glob / grep / ls，外加待办、询问、后台任务查询' },
+  { id: '读写', note: '能改文件：在上面基础上加 write / edit，仍不能开终端、不能上网' },
+  { id: '全量', note: '不限制：终端、网页、Office 等全部可用' },
+])
+
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'ls'])
+const SAFE_GROUPS = new Set(['fs_search', 'todo', 'ask', 'plan', 'step', 'jobs'])
+
+/**
+ * Read a permission profile in either language, returning the canonical label.
+ * @param {unknown} value
+ * @returns {string} `只读` | `读写` | `全量` | '' when unknown
+ */
+export function normalizeAccess(value) {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (text === '只读' || text === 'read' || text === 'readonly' || text === 'read-only') return '只读'
+  if (text === '读写' || text === 'edit' || text === 'write' || text === 'edit-write') return '读写'
+  if (text === '全量' || text === 'full' || text === 'all') return '全量'
+  return ''
+}
 
 /**
  * Render the whole plan document.
- * @param {{goal: string, session?: string, createdAt?: string, steps: Array<{n?: number, title: string, task: string, done?: string, status?: string, record?: string}>}} plan
+ * @param {{goal: string, session?: string, createdAt?: string, approvedAt?: string, steps: Array<{n?: number, title: string, task: string, done?: string, model?: string, hidden?: string[], status?: string, record?: string}>}} plan
  * @returns {string} Markdown
  */
 export function renderPlan(plan) {
   const steps = plan.steps ?? []
   const finished = steps.filter((step) => step.status === STATUS.done).length
+  const approvedAt = typeof plan.approvedAt === 'string' ? plan.approvedAt : ''
   const lines = [
     `# 任务：${oneLine(plan.goal, 200)}`,
     '',
     `- 会话：${oneLine(plan.session ?? '-', 40)}`,
     `- 创建：${oneLine(plan.createdAt ?? '-', 40)}`,
     `- 进度：${finished}/${steps.length} 完成`,
+    `- 确认：${approvedAt === '' ? NOT_APPROVED : oneLine(approvedAt, 40)}`,
   ]
   if (plan.revisedAt !== undefined && plan.revisedAt !== '') {
     lines.push(`- 修订：${oneLine(plan.revisedAt, 40)}（第 ${Number(plan.revision ?? 2)} 版）`)
@@ -40,6 +75,11 @@ export function renderPlan(plan) {
     lines.push(`### ${n}. ${oneLine(step.title, 120)} —— ${step.status ?? STATUS.todo}`)
     lines.push(`做什么：${oneLine(step.task, 4000)}`)
     if (step.done !== undefined && step.done !== '') lines.push(`完成标准：${oneLine(step.done, 2000)}`)
+    if (typeof step.access === 'string' && step.access !== '') lines.push(`权限：${oneLine(step.access, 20)}`)
+    if (typeof step.model === 'string' && step.model !== '') lines.push(`模型：${oneLine(step.model, 120)}`)
+    if (typeof step.startedAt === 'string' && step.startedAt !== '') lines.push(`开始：${oneLine(step.startedAt, 40)}`)
+    if (Array.isArray(step.dependsOn) && step.dependsOn.length > 0) lines.push(`依赖：${step.dependsOn.join(', ')}`)
+    if (Array.isArray(step.hidden) && step.hidden.length > 0) lines.push(`关闭工具：${step.hidden.map(name => oneLine(name, 60)).join(', ')}`)
     lines.push('')
   })
   const recorded = steps.filter((step) => typeof step.record === 'string' && step.record !== '')
@@ -60,13 +100,14 @@ export function renderPlan(plan) {
  * Parse a plan document written by {@link renderPlan}. Lenient: unknown lines
  * are ignored so a hand-edited file still yields usable steps.
  * @param {string} markdown
- * @returns {{goal: string, steps: Array<{n: number, title: string, task: string, done: string, status: string, record: string}>}}
+ * @returns {{goal: string, approvedAt: string, steps: Array<{n: number, title: string, task: string, done: string, access: string, model: string, hidden: string[], status: string, record: string}>}}
  */
 export function parsePlan(markdown) {
   const lines = String(markdown ?? '').split(/\r?\n/)
   let goal = ''
   let session
   let createdAt
+  let approvedAt
   let revisedAt
   let revision
   const steps = []
@@ -81,6 +122,12 @@ export function parsePlan(markdown) {
       continue
     }
     if (section === 'head') {
+      const approvedMatch = /^-\s*确认[：:]\s*(.*)$/.exec(line.trim())
+      if (approvedMatch) {
+        const value = approvedMatch[1].trim()
+        approvedAt = value === '-' || value === NOT_APPROVED ? '' : value
+        continue
+      }
       const sessionMatch = /^-\s*会话[：:]\s*(.*)$/.exec(line.trim())
       if (sessionMatch) {
         if (sessionMatch[1].trim() !== '-') session = sessionMatch[1].trim()
@@ -120,6 +167,11 @@ export function parsePlan(markdown) {
           title: stepMatch[2].trim(),
           task: '',
           done: '',
+          access: '',
+          model: '',
+          hidden: [],
+          startedAt: '',
+          dependsOn: [],
           status: stepMatch[3],
           record: '',
         }
@@ -137,6 +189,31 @@ export function parsePlan(markdown) {
           current.done = doneMatch[1].trim()
           continue
         }
+        const accessMatch = /^权限[：:]\s*(.*)$/.exec(line.trim())
+        if (accessMatch) {
+          current.access = normalizeAccess(accessMatch[1])
+          continue
+        }
+        const modelMatch = /^模型[：:]\s*(.*)$/.exec(line.trim())
+        if (modelMatch) {
+          current.model = modelMatch[1].trim()
+          continue
+        }
+        const hiddenMatch = /^关闭工具[：:]\s*(.*)$/.exec(line.trim())
+        if (hiddenMatch) {
+          current.hidden = splitNames(hiddenMatch[1])
+          continue
+        }
+        const startedMatch = /^开始[：:]\s*(.*)$/.exec(line.trim())
+        if (startedMatch) {
+          current.startedAt = startedMatch[1].trim()
+          continue
+        }
+        const dependsMatch = /^依赖[：:]\s*(.*)$/.exec(line.trim())
+        if (dependsMatch) {
+          current.dependsOn = splitNumbers(dependsMatch[1])
+          continue
+        }
       }
       continue
     }
@@ -146,7 +223,7 @@ export function parsePlan(markdown) {
         const n = Number(recordMatch[1])
         let target = steps.find((step) => step.n === n)
         if (target === undefined) {
-          target = { n, title: `步骤 ${n}`, task: '', done: '', status: recordMatch[2], record: '' }
+          target = { n, title: `步骤 ${n}`, task: '', done: '', access: '', model: '', hidden: [], startedAt: '', status: recordMatch[2], record: '' }
           steps.push(target)
         }
         target.status = recordMatch[2]
@@ -166,6 +243,7 @@ export function parsePlan(markdown) {
   steps.sort((a, b) => a.n - b.n)
   return {
     goal,
+    approvedAt: approvedAt ?? '',
     ...(session !== undefined ? { session } : {}),
     ...(createdAt !== undefined ? { createdAt } : {}),
     ...(revisedAt !== undefined ? { revisedAt } : {}),
@@ -184,8 +262,8 @@ export function parsePlan(markdown) {
  * the end instead of disappearing, which is why rewriting never destroys work
  * that actually happened.
  *
- * @param {{goal?: string, createdAt?: string, revisedAt?: string, revision?: number, steps?: Array<object>} | undefined} previous
- * @param {{goal: string, steps: Array<{title: string, task: string, done?: string}>}} incoming
+ * @param {{goal?: string, createdAt?: string, revisedAt?: string, revision?: number, approvedAt?: string, steps?: Array<object>} | undefined} previous
+ * @param {{goal: string, steps: Array<{title: string, task: string, done?: string, model?: string, hidden?: string[]}>}} incoming
  * @returns {{plan: object, kept: number, appended: number, revision: number}}
  */
 export function mergePlan(previous, incoming) {
@@ -202,11 +280,34 @@ export function mergePlan(previous, incoming) {
       ? { status: STATUS.done, record: String(match.record ?? '') }
       : { status: STATUS.todo, record: '' }
     if (match !== undefined) kept.add(match)
+    // A step the human already tuned keeps its model and tool policy, so a
+    // discussion-only revision never throws away that decision.
+    const model = step.model !== undefined && step.model !== ''
+      ? oneLine(step.model, 120)
+      : String(match?.model ?? '')
+    const hidden = step.hidden !== undefined
+      ? normalizeNames(step.hidden)
+      : normalizeNames(match?.hidden)
+    // The planner's permission profile survives unless the planner states a
+    // new one; a granular deny list (a human edit) owns the step instead.
+    const access = normalizeAccess(step.access ?? '') || (hidden.length > 0 ? '' : String(match?.access ?? ''))
+    // Dependencies are positional, so a rewritten plan restates them or keeps the
+    // previous wiring for the same title.
+    const dependsOn = step.dependsOn !== undefined
+      ? normalizeDeps(step.dependsOn, index + 1)
+      : normalizeDeps(match?.dependsOn, index + 1)
     return {
       n: index + 1,
       title: oneLine(step.title, 120) || `步骤 ${index + 1}`,
       task: oneLine(step.task, 4000),
       done: oneLine(step.done ?? '', 2000),
+      access,
+      model,
+      hidden,
+      dependsOn,
+      // A carried-over step is not running any more; only a fresh execution
+      // stamps `startedAt`.
+      startedAt: '',
       ...carried,
     }
   })
@@ -217,6 +318,10 @@ export function mergePlan(previous, incoming) {
       title: oneLine(step.title, 120),
       task: oneLine(step.task ?? '', 4000),
       done: oneLine(step.done ?? '', 2000),
+      access: String(step.access ?? ''),
+      model: String(step.model ?? ''),
+      hidden: normalizeNames(step.hidden),
+      startedAt: '',
       status: STATUS.done,
       record: String(step.record ?? ''),
     })
@@ -229,6 +334,9 @@ export function mergePlan(previous, incoming) {
       goal: oneLine(incoming.goal, 200),
       ...(previous?.session !== undefined ? { session: previous.session } : {}),
       createdAt: previous?.createdAt ?? new Date().toISOString().slice(0, 16).replace('T', ' '),
+      // Any rewrite of the plan withdraws the human's confirmation: the text
+      // that was confirmed no longer exists.
+      approvedAt: '',
       ...(revision > 1 ? { revisedAt: new Date().toISOString().slice(0, 16).replace('T', ' '), revision } : { revision: 1 }),
       steps,
     },
@@ -238,17 +346,149 @@ export function mergePlan(previous, incoming) {
   }
 }
 
+/**
+ * Replace one step's model and tool policy without touching its status, task,
+ * or recorded report. The panel is the only caller: a human choosing what runs
+ * a step must not also reset work that already happened.
+ *
+ * A granular `hidden` clears the declared permission profile: once a human
+ * unchecks individual tools, the coarse label no longer describes the step.
+ * @param {{steps: Array<object>}} plan
+ * @param {number} n
+ * @param {{model?: string, hidden?: string[], access?: string}} patch
+ * @returns {{plan: object, error?: string}}
+ */
+export function patchStep(plan, n, patch) {
+  const steps = Array.isArray(plan?.steps) ? plan.steps : []
+  const target = steps.find((step) => step.n === n)
+  if (target === undefined) return { plan, error: `没有第 ${n} 步` }
+  const next = steps.map((step) => {
+    if (step !== target) return step
+    if (patch.access !== undefined) {
+      return { ...step, access: normalizeAccess(patch.access), ...(patch.hidden === undefined ? { hidden: [] } : {}) }
+    }
+    return {
+      ...step,
+      ...(patch.model === undefined ? {} : { model: oneLine(patch.model, 120) }),
+      ...(patch.hidden === undefined ? {} : { hidden: normalizeNames(patch.hidden), access: '' }),
+    }
+  })
+  return { plan: { ...plan, steps: next } }
+}
+
+/**
+ * Mark the plan confirmed or withdraw that confirmation.
+ * @param {{steps: Array<object>}} plan
+ * @param {boolean} approved
+ * @returns {object} the plan with a fresh or cleared confirmation stamp
+ */
+export function markApproved(plan, approved) {
+  return {
+    ...plan,
+    approvedAt: approved ? new Date().toISOString().slice(0, 16).replace('T', ' ') : '',
+  }
+}
+
+/**
+ * Whether a plan may run a step: the human confirmed this exact revision.
+ * @param {{approvedAt?: string}} plan
+ * @returns {boolean}
+ */
+export function isApproved(plan) {
+  return typeof plan?.approvedAt === 'string' && plan.approvedAt !== ''
+}
+
+/**
+ * How a step's permissions read in a one-line summary.
+ * @param {{access?: string, hidden?: string[]}} step
+ * @returns {string}
+ */
+export function accessLabel(step) {
+  const declared = normalizeAccess(step?.access)
+  if (declared !== '') return declared
+  const hidden = normalizeNames(step?.hidden)
+  return hidden.length > 0 ? `自定义（关闭 ${hidden.length} 个工具）` : '全量'
+}
+
+/**
+ * How a step's model reads in a one-line summary.
+ * @param {{model?: string}} step
+ * @returns {string}
+ */
+export function modelLabel(step) {
+  const model = String(step?.model ?? '')
+  return model === '' ? '继承父会话' : model
+}
+
 function titleKey(title) {
   return String(title ?? '').replace(/\s+/g, '').replace(/（已归档）/g, '')
 }
 
 /**
- * The next step that is not finished yet.
+ * The step to run next: the first one that is neither finished nor failed, and
+ * otherwise the first failed one, so a plan whose steps all failed can be
+ * retried with the same "next step" action instead of reading as finished.
  * @param {{steps: Array<{n: number, status: string}>}} plan
  * @returns {object | undefined}
  */
 export function nextStep(plan) {
-  return (plan.steps ?? []).find((step) => step.status !== STATUS.done && step.status !== STATUS.failed)
+  const steps = plan.steps ?? []
+  // "Next" includes a step still marked running: after a crash or a restart
+  // nothing is executing it, and re-running it is the only way forward. A live
+  // run is protected by the runtime's active-run registry instead.
+  return [...steps]
+    .sort((left, right) => left.n - right.n)
+    .find((step) => step.status !== STATUS.done && depsSatisfied(steps, step))
+}
+
+/**
+ * Whether a step's declared dependencies are all finished.
+ * @param {Array<object>} steps plan steps
+ * @param {object} step
+ * @returns {boolean}
+ */
+export function depsSatisfied(steps, step) {
+  const deps = normalizeDeps(step?.dependsOn, step?.n)
+  if (deps.length === 0) return true
+  return deps.every((n) => {
+    const target = steps.find((candidate) => candidate.n === n)
+    // A dependency the plan no longer has is treated as satisfied: the plan was
+    // rewritten, and blocking forever on a missing number helps nobody.
+    return target === undefined || target.status === STATUS.done
+  })
+}
+
+/**
+ * Every step that may start now: runnable status, dependencies satisfied, and
+ * not already running. Ordered by step number.
+ * @param {{steps: Array<object>}} plan
+ * @returns {Array<object>}
+ */
+export function readySteps(plan) {
+  const steps = plan.steps ?? []
+  return steps
+    .filter((step) => RUNNABLE.has(step.status))
+    .filter((step) => depsSatisfied(steps, step))
+    .sort((left, right) => left.n - right.n)
+}
+
+/**
+ * The status of every step as a compact table the conversation can read, so a
+ * three-step plan shows 待办/进行中/失败/已取消/完成 for all three at each step.
+ * @param {{steps: Array<object>}} plan
+ * @returns {string}
+ */
+export function statusTable(plan) {
+  const steps = plan.steps ?? []
+  if (steps.length === 0) return ''
+  const width = String(steps.length).length
+  return steps.map((step) => {
+    const deps = normalizeDeps(step.dependsOn, step.n)
+    const suffix = deps.length > 0 ? `  依赖 ${deps.join(',')}` : ''
+    const model = String(step.model ?? '')
+    const who = model === '' ? '' : `  ${model}`
+    return `${String(step.n).padStart(width)}. [${step.status ?? STATUS.todo}] ${oneLine(step.title, 40)}${who}${suffix}`
+  }).join('\n')
 }
 
 /**
@@ -260,7 +500,11 @@ export function nextStep(plan) {
 export function pickStep(plan, n) {
   if (n === undefined || n === null) {
     const step = nextStep(plan)
-    return step === undefined ? { step: undefined, error: '所有步骤都已完成' } : { step }
+    if (step !== undefined) return { step }
+    const pending = (plan.steps ?? []).filter((candidate) => candidate.status !== STATUS.done)
+    if (pending.length === 0) return { step: undefined, error: '所有步骤都已完成' }
+    const blocked = pending.map((candidate) => candidate.n).join(', ')
+    return { step: undefined, error: `第 ${blocked} 步还在等前置步骤完成（依赖未满足），没有可立即执行的步骤` }
   }
   const step = (plan.steps ?? []).find((candidate) => candidate.n === n)
   return step === undefined ? { step: undefined, error: `没有第 ${n} 步` } : { step }
@@ -330,26 +574,48 @@ export function planView(plan, extra = {}) {
   const steps = Array.isArray(plan?.steps) ? plan.steps : []
   const done = steps.filter((step) => step.status === STATUS.done).length
   const failed = steps.filter((step) => step.status === STATUS.failed).length
+  const cancelled = steps.filter((step) => step.status === STATUS.cancelled).length
   const next = nextStep({ steps })
+  const ready = new Set(readySteps({ steps }).map((step) => step.n))
   return {
     goal: oneLine(plan?.goal ?? '', 200),
     total: steps.length,
     done,
     failed,
+    cancelled,
     revision: Number(plan?.revision ?? 1),
     revisedAt: oneLine(plan?.revisedAt ?? '', 40),
+    approved: isApproved(plan),
+    approvedAt: oneLine(plan?.approvedAt ?? '', 40),
     progress: progressLine({ steps }),
     current: next === undefined
       ? null
-      : { n: next.n, title: oneLine(next.title, 120), task: oneLine(next.task, 300) },
+      : {
+        n: next.n,
+        title: oneLine(next.title, 120),
+        task: oneLine(next.task, 300),
+        status: next.status ?? STATUS.todo,
+        model: oneLine(next.model ?? '', 120),
+        access: normalizeAccess(next.access),
+        hidden: normalizeNames(next.hidden),
+        startedAt: oneLine(next.startedAt ?? '', 40),
+      },
     steps: steps.map((step) => ({
       n: step.n,
       title: oneLine(step.title, 120),
       status: step.status ?? STATUS.todo,
       task: oneLine(step.task, 240),
       done: oneLine(step.done ?? '', 160),
+      access: normalizeAccess(step.access),
+      model: oneLine(step.model ?? '', 120),
+      hidden: normalizeNames(step.hidden),
+      startedAt: oneLine(step.startedAt ?? '', 40),
+      dependsOn: normalizeDeps(step.dependsOn, step.n),
+      ready: ready.has(step.n),
       record: oneLine(step.record ?? '', 400),
     })),
+    ready: ready.size,
+    readySteps: [...ready].sort((left, right) => left - right),
     ...extra,
   }
 }
@@ -358,11 +624,14 @@ export function planView(plan, extra = {}) {
  * Grammar of the `/slice` command. Kept next to the plan format so the dock
  * buttons, the slash command, and the tests agree on one spelling.
  * @param {string} rawInput text after `slice`
- * @returns {{action: 'show' | 'next' | 'plan' | 'revise', step?: number, goal?: string, feedback?: string, error?: string}}
+ * @returns {{action: 'show' | 'next' | 'plan' | 'revise' | 'approve' | 'unapprove', step?: number, goal?: string, feedback?: string, error?: string}}
  */
 export function parseSliceCommand(rawInput) {
   const text = String(rawInput ?? '').trim()
   if (text === '' || text === 'show' || text === 'status' || text === '进度') return { action: 'show' }
+  if (text === 'approve' || text === '确认') return { action: 'approve' }
+  const revoke = /^(?:approve\s+(?:off|no)|unapprove|取消确认)$/.exec(text)
+  if (revoke !== null) return { action: 'unapprove' }
   const step = /^(?:next|run|step|执行)\s*(\d*)$/.exec(text)
   if (step !== null) {
     if (step[1] === '') return { action: 'next' }
@@ -370,6 +639,10 @@ export function parseSliceCommand(rawInput) {
     if (!Number.isInteger(n) || n < 1) return { action: 'next', error: `步骤号无效：${step[1]}` }
     return { action: 'next', step: n }
   }
+  const stop = /^(?:stop|halt|cancel|停止|停|取消执行)$/.exec(text)
+  if (stop !== null) return { action: 'stop' }
+  if (/^(?:parallel|par|并行|一起跑)$/.test(text)) return { action: 'parallel' }
+  if (/^(?:auto|all|run-all|顺次|自动|跑完|一路跑)$/.test(text)) return { action: 'auto' }
   const revise = /^(?:revise|改|修订)\s+([\s\S]+)$/.exec(text)
   if (revise !== null) {
     const feedback = revise[1].trim().slice(0, 2000)
@@ -387,7 +660,7 @@ export function parseSliceCommand(rawInput) {
   }
   return {
     action: 'show',
-    error: `不认识的参数：${oneLine(text, 60)}；用法：/slice [plan <目标> | revise <意见> | next [步骤号] | show]`,
+    error: `不认识的参数：${oneLine(text, 60)}；用法：/slice [plan <目标> | revise <意见> | approve | unapprove | next [步骤号] | auto | parallel | stop | show]`,
   }
 }
 
@@ -600,8 +873,8 @@ const GROUP_LABELS = Object.freeze({
   goal: '目标',
   skill: '技能',
   todo: '待办',
-  plan: '切片工作法',
-  step: '切片工作法',
+  plan: 'plan-act',
+  step: 'plan-act',
   exit_plan_mode: '计划模式',
   present: '交付文件',
   ask_user_question: '询问用户',
@@ -615,6 +888,96 @@ function oneLine(text, maxChars) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxChars)
+}
+
+/**
+ * Read a comma-separated tool list back from the plan Markdown.
+ * @param {string} text
+ * @returns {string[]}
+ */
+function splitNames(text) {
+  return String(text ?? '')
+    .split(/[,，、]/)
+    .map((name) => name.trim())
+    .filter((name) => name !== '')
+}
+
+/**
+ * Read a comma-separated step-number list (the `依赖：` line).
+ * @param {string} text
+ * @returns {number[]}
+ */
+function splitNumbers(text) {
+  return String(text ?? '')
+    .split(/[,，、\s]+/)
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isInteger(value) && value > 0)
+    .filter((value, index, all) => all.indexOf(value) === index)
+    .sort((left, right) => left - right)
+}
+
+/**
+ * Normalize a dependency list: positive integers, unique, sorted, never self.
+ * @param {unknown} value
+ * @param {number} [self]
+ * @returns {number[]}
+ */
+export function normalizeDeps(value, self) {
+  const source = Array.isArray(value) ? value : typeof value === 'string' ? splitNumbers(value) : []
+  const seen = new Set()
+  for (const item of source) {
+    const n = Number(item)
+    if (!Number.isInteger(n) || n <= 0 || n === self) continue
+    seen.add(n)
+  }
+  return [...seen].sort((left, right) => left - right)
+}
+
+/**
+ * Unique, sorted, non-empty tool names — the deny list a step is stored with.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function normalizeNames(value) {
+  if (!Array.isArray(value)) return []
+  const seen = new Set()
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (name !== '') seen.add(name)
+  }
+  return [...seen].sort()
+}
+
+/**
+ * Turn one step's permission profile into the deny list the child is restricted
+ * with. Derived from the tools the child actually mounts, so a profile never
+ * names a tool this deployment does not have.
+ * @param {unknown} access permission profile (either language)
+ * @param {Array<string | {name: string}>} tools tool names or definitions
+ * @returns {string[]} sorted deny list; empty means "no restriction"
+ */
+export function accessHidden(access, tools) {
+  const mode = normalizeAccess(access)
+  if (mode === '' || mode === '全量') return []
+  const names = []
+  for (const tool of tools ?? []) {
+    const name = typeof tool === 'string' ? tool : tool?.name
+    if (typeof name === 'string' && name !== '') names.push(name)
+  }
+  const deny = []
+  for (const name of names) {
+    const group = groupOfTool(name)
+    if (mode === '只读') {
+      if (READ_ONLY_TOOLS.has(name) || SAFE_GROUPS.has(group)) continue
+      deny.push(name)
+      continue
+    }
+    // 读写: everything in the filesystem groups plus the harmless helpers.
+    if (group === 'fs' || SAFE_GROUPS.has(group)) continue
+    deny.push(name)
+  }
+  return [...new Set(deny)].sort()
 }
 
 function lastLines(text, count) {

@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Tool switches and slice workflow",
-    "description": "Turn unused tool definitions off to shrink the prompt, and split a task into a Markdown plan whose steps run one at a time in fresh subagents."
+    "title": "Tool switches and plan-act",
+    "description": "Turn unused tool definitions off to shrink the prompt; plan-act: discuss the goal, split it into a small-step plan, then run each step in a fresh subagent so small local models do one small thing per turn instead of over-thinking."
   }
 }
