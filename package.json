@@ -3,7 +3,7 @@
   "version": "0.5.0",
   "private": true,
   "type": "module",
-  "description": "按需关闭工具定义，并把任务拆成 Markdown 计划、逐步交给子代理执行，压缩本地小模型的上下文。",
+  "description": "按需关闭工具定义，并用 plan-act 工作法：先多轮讨论把任务拆成小步计划，再逐步交给子代理执行，让本地小模型一次只做一件小事，避免长篇大思考。",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -40,6 +40,7 @@
     "cordis",
     "context-engineering"
   ],
+  "engines": { "dsh": ">=0.2.2-rc.5 <0.3.0" },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
