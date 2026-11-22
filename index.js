@@ -9,6 +9,7 @@
  * them. Nothing is registered globally except this plugin's own routes and the
  * `/slice` command, and the mask costs no prompt tokens by itself.
  */
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -344,6 +345,21 @@ export function apply(ctx) {
   }
 
   /**
+   * Build the complete UserMessage that `agent.followup` accepts.
+   *
+   * The Host API takes an already identified message: it stamps neither an id
+   * nor a role, and the event log only restores a `user/message` whose message
+   * carries both. Handing it a bare content/source pair therefore appends an
+   * anonymous user message that makes the whole Session fail validation on the
+   * next start ("session event at seq N lacks an identified message").
+   * @param {object[]} content message content blocks
+   * @returns {{id: string, role: 'user', content: object[], source: {kind: 'user'}}}
+   */
+  function injectedUserMessage(content) {
+    return { id: randomUUID(), role: 'user', content, source: { kind: 'user' } }
+  }
+
+  /**
    * One grammar, three callers: the composer, the dock buttons, and `/slice`.
    * @param {object} context Host context (services are resolved lazily by workflow.mjs)
    * @param {object} agent receiving Agent
@@ -381,10 +397,9 @@ export function apply(ctx) {
         if (typeof followup !== 'function') {
           return { kind: 'error', text: '这个会话无法从指令注入消息：请直接在输入框里说“按计划顺次执行”。' }
         }
-        await followup.call(agent, {
-          content: [{ type: 'text', text: autoPrompt(plan) }],
-          source: { kind: 'user' },
-        })
+        await followup.call(agent, injectedUserMessage([
+          { type: 'text', text: autoPrompt(plan) },
+        ]))
         return {
           kind: 'success',
           text: '已开始自动顺次执行：模型会一步步调用 step_run，每步的报告都会出现在对话里；要停就点「停止全部」或 /slice stop。',
@@ -398,12 +413,13 @@ export function apply(ctx) {
           return { kind: 'error', text: '这个会话无法从指令注入消息：请直接在输入框里描述目标。' }
         }
         const goal = parsed.action === 'revise' ? await planGoalOf(context, agent) : ''
-        await followup.call(agent, {
-          content: [{ type: 'text', text: parsed.action === 'plan'
-            ? planRequestPrompt(parsed.goal ?? '')
-            : revisePrompt(parsed.feedback ?? '', goal) }],
-          source: { kind: 'user' },
-        })
+        await followup.call(agent, injectedUserMessage([
+          {
+            type: 'text', text: parsed.action === 'plan'
+              ? planRequestPrompt(parsed.goal ?? '')
+              : revisePrompt(parsed.feedback ?? '', goal),
+          },
+        ]))
         return {
           kind: 'success',
           text: parsed.action === 'plan'

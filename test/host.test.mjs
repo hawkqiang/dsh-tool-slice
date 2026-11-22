@@ -802,3 +802,25 @@ test('/slice auto only starts when the plan is approved and has ready work', asy
   assert.match(sent[0].content[0].text, /自动顺次执行/)
   assert.match(started.text, /自动顺次执行/)
 })
+
+test('/slice hands the Agent identified user messages', async () => {
+  const h = harness()
+  const sent = []
+  const agent = { ...fakeAgent('s-msg9', PLAN_ACT_TOOLS, []), followup: async (input) => { sent.push(input) } }
+
+  const planned = await h.commands.get('slice').handler({ agent, rawInput: 'plan 给登录页加验证码' })
+  assert.equal(planned.kind, 'success')
+  const revised = await h.commands.get('slice').handler({ agent, rawInput: 'revise 先补测试' })
+  assert.equal(revised.kind, 'success')
+
+  assert.equal(sent.length, 2)
+  for (const message of sent) {
+    // followup takes a complete UserMessage; it stamps neither field, and an
+    // anonymous user/message makes the whole Session unloadable on restart.
+    assert.equal(message.role, 'user')
+    assert.match(message.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+    assert.deepEqual(message.source, { kind: 'user' })
+    assert.ok(Array.isArray(message.content) && message.content.length > 0)
+  }
+  assert.notEqual(sent[0].id, sent[1].id, 'each injected message has its own identity')
+})
