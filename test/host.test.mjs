@@ -29,7 +29,7 @@ function post(h, route, sessionId, body) {
 }
 
 /** A minimal Cordis-shaped context with the services this plugin uses. */
-function harness() {
+function harness(globalTools = []) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'tool-slice-host-'))
   process.env.DSH_PROFILE_DIR = profile
   const handlers = new Map()
@@ -39,6 +39,8 @@ function harness() {
   const spawns = []
   const ctx = {
     logger: { warn: (message) => warnings.push(String(message)) },
+    // The un-scoped tool view: what the panel lists before any Agent exists.
+    tools: { definitions: () => globalTools, restrict: () => () => {} },
     // A step's child only needs a service that hands back a finished result.
     subagents: {
       startActivation: async (spec) => {
@@ -127,6 +129,22 @@ test('the state route is registered and reports no inventory before an agent', a
   assert.equal(snapshot.statePath, h.stateFile)
 })
 
+test('a brand-new conversation lists the global tools before any agent exists', async () => {
+  // The regression: a fresh session has no Agent until its first step, so an
+  // Agent-only inventory left the panel empty and every control disabled — the
+  // user saw no tool bar at all. The un-scoped view must seed it.
+  const h = harness([
+    { name: 'read', description: 'read a file', parameters: { type: 'object', properties: {} } },
+    { name: 'bash', description: 'run a command', parameters: { type: 'object', properties: {} } },
+  ])
+  const snapshot = await state(h)
+  assert.equal(snapshot.ready, true, 'the panel is usable with no Agent running')
+  assert.deepEqual(snapshot.tools.map((tool) => tool.name), ['bash', 'read'])
+  assert.ok(snapshot.totalTokens > 0)
+  // The client compares this with its own copy to notice an open page that is
+  // still running the previous bundle after a Host-only reload.
+  assert.equal(typeof snapshot.codeVersion, 'number')
+})
 test('an agent inventories the tools and is not restricted when nothing is hidden', async () => {
   const h = harness()
   const calls = []

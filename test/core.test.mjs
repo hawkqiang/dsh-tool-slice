@@ -304,6 +304,26 @@ test('patchStep keeps the profile and the granular list mutually exclusive', () 
   assert.deepEqual(profiled.steps[0].hidden, [])
   assert.deepEqual(patchStep(plan, 9, {}).error, '没有第 9 步')
 })
+test('one patchStep call writes every field it was given', () => {
+  const plan = { steps: [{ n: 1, title: 't', task: 'x', access: '只读', model: '', hidden: [] }] }
+  // The panel route accepts model and access in the same request; branching on
+  // access first used to drop the model on the floor.
+  const both = patchStep(plan, 1, { model: 'deepseek-account/deepseek-v4-pro', access: '读写' }).plan
+  assert.equal(both.steps[0].model, 'deepseek-account/deepseek-v4-pro')
+  assert.equal(both.steps[0].access, '读写')
+  assert.deepEqual(both.steps[0].hidden, [])
+  // A non-empty deny list still wins over the coarse label when both arrive.
+  const granular = patchStep(plan, 1, { model: 'm/x', access: '全量', hidden: ['web_search'] }).plan
+  assert.equal(granular.steps[0].model, 'm/x')
+  assert.equal(granular.steps[0].access, '')
+  assert.deepEqual(granular.steps[0].hidden, ['web_search'])
+  // A model-only edit leaves the policy of the step alone.
+  const modelOnly = patchStep(both, 1, { model: '' }).plan
+  assert.equal(modelOnly.steps[0].model, '')
+  assert.equal(modelOnly.steps[0].access, '读写')
+  // A malformed patch argument is a no-op rather than a throw.
+  assert.equal(patchStep(plan, 1, undefined).plan.steps[0].access, '只读')
+})
 test('planView exposes which model and permission the current step will use', () => {
   const parsed = parsePlan(renderPlan({
     goal: 'g',

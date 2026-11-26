@@ -65,18 +65,24 @@ test('client module registers one factory under the package name', () => {
   assert.equal(typeof exported.apply, 'function')
 })
 
-test('apply registers the bundle page and the composer dock', () => {
+test('apply registers the bundle page, the composer dock and the New Session chip', () => {
   const { exported } = loadClient()
   const fake = fakeContext()
   exported.apply(fake.ctx)
-  assert.deepEqual(fake.injected, ['plugins.bundle.config', 'conversation.composer.dock'])
-  assert.equal(fake.registrations.length, 2)
-  const [page, dock] = fake.registrations
+  assert.deepEqual(fake.injected, ['plugins.bundle.config', 'conversation.composer.dock', 'conversation.hero.options'])
+  assert.equal(fake.registrations.length, 3)
+  const [page, dock, hero] = fake.registrations
   assert.equal(page.options.name, 'plugins.bundle.config')
   assert.equal(page.options.key, manifest.name)
   assert.equal(dock.options.name, 'conversation.composer.dock')
   assert.equal(dock.options.id, 'tool-slice-dock')
   assert.equal(typeof dock.renderer, 'function')
+  // A conversation without a first message renders the composer in its hero
+  // variant, which never renders `conversation.composer.dock`; the New Session
+  // row needs its own entry or the switches are unreachable there.
+  assert.equal(hero.options.name, 'conversation.hero.options')
+  assert.equal(hero.options.id, 'tool-slice-hero')
+  assert.equal(typeof hero.renderer, 'function')
   assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-conversation'))
 })
 
@@ -108,4 +114,21 @@ test('the summary view renders a short string without touching the network', () 
   const view = page.renderer({ view: 'page' })
   assert.equal(typeof view, 'object')
   assert.equal(typeof view.type, 'function', 'the page view mounts the card component')
+})
+test('one slot that rejects the page does not take the other two down', () => {
+  // An Android WebView was seen to stop a bare apply right after the first
+  // slots.inject, leaving no tool bar and no visible reason. Each surface is
+  // registered independently so a page that lacks or refuses one slot still
+  // gets the rest.
+  const { exported } = loadClient()
+  const fake = fakeContext()
+  fake.ctx.slots.inject = (name, callback) => {
+    fake.injected.push(name)
+    if (name === 'plugins.bundle.config') throw new Error('this page has no bundle page')
+    callback()
+  }
+  exported.apply(fake.ctx)
+  assert.deepEqual(fake.injected, ['plugins.bundle.config', 'conversation.composer.dock', 'conversation.hero.options'])
+  assert.equal(fake.registrations.length, 2, 'the dock and the New Session chip still registered')
+  assert.deepEqual(fake.registrations.map((entry) => entry.options.name), ['conversation.composer.dock', 'conversation.hero.options'])
 })

@@ -27,6 +27,16 @@ export const name = 'tool-slice'
 export const inject = ['tools']
 
 const STATE_VERSION = 2
+/**
+ * Bumped in step with `client.js`'s copy whenever the pair must agree.
+ *
+ * A browser assembles client bundles at page load, so a Host-only reload (a
+ * plugin row restart, which is how a fix lands without killing the server)
+ * leaves an already-open page running the previous UI — "I refreshed the plugin
+ * and nothing changed". The client compares this number with its own and says
+ * so instead of silently behaving like the old version.
+ */
+const CODE_VERSION = 2
 const MAX_SCENARIOS = 24
 const MAX_HIDDEN = 400
 const MAX_SESSIONS = 200
@@ -102,6 +112,8 @@ export function apply(ctx) {
   const agents = new WeakMap()
   /** @type {{tools: Array<{name: string, tokens: number, summary: string}>, totalTokens: number} | undefined} */
   let inventory
+  /** Whether the inventory ever saw a live Agent (its view is the complete one). */
+  let capturedFromAgent = false
 
   const knownNames = () => new Set((inventory?.tools ?? []).map((tool) => tool.name))
 
@@ -138,9 +150,13 @@ export function apply(ctx) {
   /** Union of every tool seen in any Agent, so several presets all appear. */
   const seenTools = new Map()
 
-  /** Record every tool this Agent can currently see; the page lists these. */
-  function captureInventory(agent) {
-    const definitions = agent.ctx.tools.definitions(agent)
+  /**
+   * Fold one definition list into the inventory and rebuild the derived view.
+   * Both capture paths (a live Agent's scope and the global view) land here, so
+   * a name seen once stays listed even after that Agent is disposed.
+   * @param {Array<{name: string, description?: string, parameters?: unknown}>} definitions
+   */
+  function recordDefinitions(definitions) {
     for (const definition of definitions) {
       seenTools.set(definition.name, {
         name: definition.name,
@@ -156,6 +172,37 @@ export function apply(ctx) {
     inventory = {
       tools,
       totalTokens: tools.reduce((sum, tool) => sum + tool.tokens, 0),
+    }
+  }
+
+  /** Record every tool this Agent can currently see; the page lists these. */
+  function captureInventory(agent) {
+    recordDefinitions(agent.ctx.tools.definitions(agent))
+  }
+
+  /**
+   * Seed the inventory from the **global** registered view, with no Agent in
+   * scope.
+   *
+   * A brand-new conversation has no Agent until its first step, so the
+   * Agent-scoped capture above never runs there and the panel used to say
+   * "还没有会话创建过智能体" with every control disabled — the new-session tool
+   * bar looked missing entirely. `ctx.tools.definitions()` with no argument
+   * selects the global view (see the tools service contract), which the base
+   * bundle's tool plugins register into, so the switches work before any
+   * message is sent. Preset-scoped extras (plan_write/step_run) still arrive
+   * later through the Agent-scoped path and are merged, not replaced.
+   */
+  function captureGlobalInventory() {
+    try {
+      const definitions = ctx.tools.definitions()
+      // An empty global view (a composition that mounts no tools at the root)
+      // must not flip `ready` on with a blank list; leave the Agent-scoped path
+      // to fill it in later.
+      if (!Array.isArray(definitions) || definitions.length === 0) return
+      recordDefinitions(definitions)
+    } catch (error) {
+      log(`global tool inventory unavailable: ${messageOf(error)}`)
     }
   }
 
@@ -199,6 +246,10 @@ export function apply(ctx) {
     if (agents.has(agent)) return
     try {
       captureInventory(agent)
+      // A live Agent's view is the complete one for its preset: the global
+      // view only holds root-registered tools (a web profile mounts the tool
+      // rows inside each preset instead), so the panel can say which one it got.
+      capturedFromAgent = true
     } catch (error) {
       log(`tool inventory unavailable: ${messageOf(error)}`)
     }
@@ -619,6 +670,10 @@ export function apply(ctx) {
    * @returns {object}
    */
   function snapshot(request) {
+    // Every panel read refreshes the un-scoped view first: a fresh conversation
+    // has no Agent, so this is the only moment the global tool list can be
+    // captured before the first step.
+    if (inventory === undefined) captureGlobalInventory()
     const tools = inventory?.tools ?? []
     let sessionId = ''
     try {
@@ -633,6 +688,11 @@ export function apply(ctx) {
     return {
       version: STATE_VERSION,
       ready: inventory !== undefined,
+      // 'agents' = at least one live Agent's complete view; 'global' = only the
+      // root-registered subset so far (a brand-new conversation, cold start).
+      inventorySource: capturedFromAgent ? 'agents' : 'global',
+      // The client compares this with its own copy to notice a stale page.
+      codeVersion: CODE_VERSION,
       revision: state.revision,
       // `hidden` is the list that applies to this caller; `globalHidden` and
       // `session` let the UI say where it came from and offer "follow global".

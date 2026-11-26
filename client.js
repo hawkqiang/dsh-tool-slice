@@ -7,6 +7,12 @@ window.__ModuleLoader__.load({
     const NS = '@local/dsh-tool-slice'
     const ENDPOINT = '/api/tool-slice'
     const DOCK_KEY = 'dsh.tool-slice.dock'
+    /**
+     * Must equal `CODE_VERSION` in index.js. The page keeps the client bundle it
+     * loaded, so after a Host-only reload this copy is stale; comparing the two
+     * lets the chips say 「插件已更新，请刷新页面」 instead of looking unchanged.
+     */
+    const CODE_VERSION = 2
 
     const css = `
 .tsl-card{color:var(--dsw-alias-label-primary,inherit);border:1px solid var(--dsw-alias-border-l3,#8885);border-radius:16px;background:var(--dsw-alias-bg-module-platform,transparent);overflow:hidden;font-size:14px}
@@ -51,6 +57,12 @@ window.__ModuleLoader__.load({
 .tsl-note{margin:10px 0 0;padding:11px 14px;border-radius:10px;background:var(--dsw-alias-bg-module-secondary,#8881)}
 @media(max-width:480px){.tsl-card summary{padding:18px}.tsl-body{padding:0 18px 18px}.tsl-status{width:100%;margin-left:0}}
 .tsd{position:relative;width:100%;display:flex;flex-direction:column;align-items:center;color:var(--dsw-alias-label-primary,inherit);font-size:12.5px}
+/* The New Session row is a compact flex line right-aligned beside the preset
+   picker, so this chip must not claim the whole width, and its card has to grow
+   down from the row instead of up over the fold. */
+.tsd-hero{width:auto;flex:none;align-items:flex-end}
+.tsd-hero .tsd-chip{font-size:12px;padding:2px 9px;gap:6px}
+.tsd-hero .tsd-pop{top:calc(100% + 6px);bottom:auto;left:auto;right:0;transform:none;width:min(560px,calc(100vw - 24px))}
 .tsd-bar{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;padding:2px}
 .tsd-chip{font:inherit;display:inline-flex;align-items:center;gap:7px;border:1px solid var(--dsw-alias-border-l3,#8885);background:var(--dsw-alias-bg-module-secondary,#8881);color:var(--dsw-alias-label-secondary,#888);border-radius:999px;padding:3px 10px;cursor:pointer;line-height:1.5}
 .tsd-chip:hover{color:var(--dsw-alias-label-primary,inherit)}
@@ -175,10 +187,12 @@ window.__ModuleLoader__.load({
         setScenarios(Array.isArray(next.scenarios) ? next.scenarios : [])
       }, [])
 
-      const load = useCallback((signal) => {
-        fetch(`${ENDPOINT}/state${suffix}`, { credentials: 'same-origin', signal })
+      // `keepDraft` is for a save that only changed the shared default: the
+      // caller's unsaved switch list must stay exactly as it was.
+      const load = useCallback((signal, keepDraft = false) => {
+        return fetch(`${ENDPOINT}/state${suffix}`, { credentials: 'same-origin', signal })
           .then((response) => response.json())
-          .then((next) => { adopt(next); setError('') })
+          .then((next) => { adopt(next, keepDraft); setError('') })
           .catch((cause) => {
             if (cause?.name !== 'AbortError') setError(`读取工具清单失败：${cause?.message ?? cause}`)
           })
@@ -249,6 +263,35 @@ window.__ModuleLoader__.load({
           setSaving(false)
         }
       }, [adopt, hidden, sessionId, suffix])
+
+      /**
+       * Save the current draft as the profile's **default** switch list.
+       *
+       * The default is what a conversation follows until it saves a list of its
+       * own, so this is the one control a user needs in a brand-new session — and
+       * the one the dock used to be missing (changing the default meant opening
+       * Plugins → this bundle). The caller's own saved list is never touched.
+       * @returns {Promise<boolean>}
+       */
+      const saveAsDefault = useCallback(async () => {
+        setSaving(true)
+        setError('')
+        setNotice('')
+        try {
+          // No `session` query: the Host writes the profile default.
+          await request('/save', { method: 'POST', body: JSON.stringify({ hidden: [...hidden].sort() }) })
+          // Re-read this caller's view (keeping the draft) so the source pill
+          // still says truthfully whether this conversation follows the default.
+          await load(undefined, true)
+          setNotice('已保存为默认：还没单独保存过的对话都用这套开关。')
+          return true
+        } catch (cause) {
+          setError(`保存默认失败：${cause?.message ?? cause}`)
+          return false
+        } finally {
+          setSaving(false)
+        }
+      }, [hidden, load])
 
       /**
        * Create or replace a scenario from the current draft. Scenarios are
@@ -333,12 +376,16 @@ window.__ModuleLoader__.load({
         data, hidden, scenarios, saving, error, notice, query, setQuery, sessionId, scenarioName,
         tools, groups, enabledCount, enabledTokens, savedTokens, dirty,
         ready: data !== undefined && data.ready !== false,
+        // The Host was reloaded from newer files than this already-open page:
+        // the UI below is the previous version, so say that instead of silently
+        // behaving like it.
+        needsRefresh: data !== undefined && Number(data.codeVersion) !== CODE_VERSION,
         builtIn: data?.builtInScenarios ?? [],
         override: data?.session?.override === true,
         source: data?.source ?? 'global',
         // Which scheme the draft currently equals, so the selector can show it.
         selected: scenarioOf([...scenarios, ...(data?.builtInScenarios ?? [])], hidden),
-        load, save, adopt, toggle, toggleGroup, applyScenario, saveAsScenario, removeScenario,
+        load, save, saveAsDefault, adopt, toggle, toggleGroup, applyScenario, saveAsScenario, removeScenario,
         setHidden, setNotice, setError, setScenarioName,
       }
     }
@@ -490,7 +537,13 @@ window.__ModuleLoader__.load({
             className: 'tsl-button',
             onClick: () => { slice.setHidden(new Set(slice.tools.map((tool) => tool.name))); slice.setNotice('') },
           }, '全部关闭')),
-        h('div', { className: 'tsl-groups' }, slice.groups.map((group) => renderGroup(slice, group))))
+        h('div', { className: 'tsl-groups' }, slice.groups.map((group) => renderGroup(slice, group))),
+        // A cold start can only see the root-registered tools; say so instead of
+        // letting a preset-mount look like "the preset has no tools".
+        slice.data?.inventorySource === 'global'
+          ? h('p', { className: 'tsl-muted', style: { margin: '8px 0 0' } },
+              '清单来自全局工具集：这个进程里还没有会话跑过一步。任意会话开始工作后，这里会自动补上该预设挂载的工具。')
+          : null)
     }
 
     /** The bundle page: the long-lived editor for the default and the scenarios. */
@@ -542,7 +595,10 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               className: 'tsl-button tsl-button-primary',
-              disabled: !slice.ready || slice.saving || !slice.dirty,
+              // Saving the default is idempotent, so it stays available even when
+              // the draft already equals it: a disabled "保存默认" reads as "this
+              // is not editable", which is exactly the trap the panel had.
+              disabled: !slice.ready || slice.saving,
               onClick: () => { void slice.save() },
             }, slice.saving ? '保存中…' : '保存默认'),
             h('button', {
@@ -698,6 +754,57 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The floating panel both dock entry points share.
+     *
+     * It opens upward over the transcript — the trigger sits at the bottom of the
+     * screen, so a card that grew downward would cover the composer — capped by
+     * the space that actually exists above the chip, and it closes on an outside
+     * click or Escape exactly like the composer's own menus.
+     * @param {string} open which panel is open (`''` when closed)
+     * @param {() => void} close the caller's close handler
+     * @param {'up' | 'down'} [side] which way the card grows
+     * @returns {{rootRef: object, spaceAbove: number}}
+     */
+    function useDockPanel(open, close, side = 'up') {
+      const rootRef = useRef(null)
+      const [spaceAbove, setSpaceAbove] = useState(420)
+      useEffect(() => {
+        if (open === '') return undefined
+        const measure = () => {
+          const node = rootRef.current
+          if (node === null || node === undefined || typeof node.getBoundingClientRect !== 'function') return
+          const rect = node.getBoundingClientRect()
+          // The composer dock hangs at the bottom of the window, so its card
+          // grows up from the chip; the New Session row sits mid-screen above
+          // the composer, so its card grows down instead of off the top edge.
+          const room = side === 'up'
+            ? rect.top - 16
+            : (window.innerHeight || rect.bottom) - rect.bottom - 16
+          setSpaceAbove(Math.max(200, Math.min(420, room)))
+        }
+        measure()
+        window.addEventListener('resize', measure)
+        return () => { window.removeEventListener('resize', measure) }
+      }, [open])
+      useEffect(() => {
+        if (open === '') return undefined
+        const onDown = (event) => {
+          const node = rootRef.current
+          if (node === null || node === undefined || typeof node.contains !== 'function') return
+          if (!node.contains(event.target)) close()
+        }
+        const onKey = (event) => { if (event.key === 'Escape') close() }
+        document.addEventListener('mousedown', onDown)
+        document.addEventListener('keydown', onKey)
+        return () => {
+          document.removeEventListener('mousedown', onDown)
+          document.removeEventListener('keydown', onKey)
+        }
+      }, [open, close])
+      return { rootRef, spaceAbove }
+    }
+
+    /**
      * The panel beside the conversation: the same tool switches as the page
      * (saved on every click) plus the plan's controls and progress, so neither
      * needs a trip to the Plugins page.
@@ -714,7 +821,6 @@ window.__ModuleLoader__.load({
       const [goal, setGoal] = useState('')
       const [feedback, setFeedback] = useState('')
       const [showSteps, setShowSteps] = useState(true)
-      const [spaceAbove, setSpaceAbove] = useState(420)
       const [models, setModels] = useState([])
       const [toolDraft, setToolDraftState] = useState(null)
       // The unified settings at the top of the panel: a permission profile plus a
@@ -724,46 +830,11 @@ window.__ModuleLoader__.load({
       const [unifiedOpen, setUnifiedOpen] = useState(false)
       const [unifiedCollapsed, setUnifiedCollapsed] = useState(false)
       const [stepError, setStepError] = useState('')
-      const rootRef = useRef(null)
       const pollRef = useRef(null)
       const aliveRef = useRef(true)
       const slice = useSlice({ auto: true, sessionId })
-
-      // The popover floats over the transcript above the composer, so its height
-      // cap comes from the space that actually exists there (a short window
-      // would otherwise push the card off the top of the screen).
-      useEffect(() => {
-        if (open === '') return undefined
-        const measure = () => {
-          const node = rootRef.current
-          if (node === null || node === undefined || typeof node.getBoundingClientRect !== 'function') return
-          const rect = node.getBoundingClientRect()
-          setSpaceAbove(Math.max(200, Math.min(420, rect.top - 16)))
-        }
-        measure()
-        window.addEventListener('resize', measure)
-        return () => { window.removeEventListener('resize', measure) }
-      }, [open])
-
-      // The card covers part of the composer while it is open, so a click
-      // anywhere outside it (the input, the transcript, a sidebar) dismisses it,
-      // exactly like the composer's own menus.
-      useEffect(() => {
-        if (open === '') return undefined
-        const dismiss = () => { writeOpen(''); setOpen('') }
-        const onDown = (event) => {
-          const node = rootRef.current
-          if (node === null || node === undefined || typeof node.contains !== 'function') return
-          if (!node.contains(event.target)) dismiss()
-        }
-        const onKey = (event) => { if (event.key === 'Escape') dismiss() }
-        document.addEventListener('mousedown', onDown)
-        document.addEventListener('keydown', onKey)
-        return () => {
-          document.removeEventListener('mousedown', onDown)
-          document.removeEventListener('keydown', onKey)
-        }
-      }, [open])
+      const closePanel = useCallback(() => { writeOpen(''); setOpen('') }, [])
+      const { rootRef, spaceAbove } = useDockPanel(open, closePanel)
 
       useEffect(() => {
         aliveRef.current = true
@@ -948,11 +1019,14 @@ window.__ModuleLoader__.load({
         className: 'tsd-chip',
         'data-on': String(open === 'tools'),
         onClick: () => togglePanel('tools'),
-        title: '关闭用不到的工具，减少每轮的工具定义 token',
+        title: slice.needsRefresh
+          ? '插件已在服务端更新，这个页面还在跑旧版：刷新一次浏览器页面即可用上新界面'
+          : '关闭用不到的工具，减少每轮的工具定义 token',
       },
         h('span', { className: 'tsd-dot', 'aria-hidden': true }),
         '工具 ',
-        h('b', null, slice.ready ? `${slice.enabledCount}/${slice.tools.length}` : '…'))
+        h('b', null, slice.ready ? `${slice.enabledCount}/${slice.tools.length}` : '…'),
+        slice.needsRefresh ? h('span', { className: 'tsd-pill-warn tsd-pill-access' }, '需刷新') : null)
 
       const toolPanel = open === 'tools'
         ? h('div', { className: 'tsd-pop', style: { maxHeight: `${spaceAbove}px` } },
@@ -966,6 +1040,7 @@ window.__ModuleLoader__.load({
               board(slice),
               h('p', { className: 'tsd-note' },
                 '改完点底部的「保存本对话」才会生效，且只影响这个对话；其他对话用各自的开关或默认值。'),
+              slice.needsRefresh ? h('p', { className: 'tsd-error' }, '插件已在服务端更新：刷新一次浏览器页面，就会出现完整的新界面（这个页面还停在旧版）。') : null,
               slice.error !== '' ? h('p', { className: 'tsd-error' }, slice.error) : null),
             // Pinned footer: the scrollport is the body, so Save and Undo are on
             // screen no matter how long the tool list is.
@@ -982,6 +1057,15 @@ window.__ModuleLoader__.load({
                 disabled: !slice.ready || slice.saving || !slice.dirty,
                 onClick: () => { slice.adopt(slice.data); slice.setNotice('') },
               }, '撤销'),
+              // Changing the profile default used to require the Plugins page.
+              // It belongs here, next to the switches it describes.
+              h('button', {
+                type: 'button',
+                className: 'tsl-button',
+                disabled: !slice.ready || slice.saving,
+                title: '把这套开关存成默认值：还没单独保存过的对话都用它（本对话自己的清单不变）',
+                onClick: () => { void slice.saveAsDefault() },
+              }, '存为默认'),
               slice.override
                 ? h('button', {
                     type: 'button',
@@ -1358,27 +1442,126 @@ window.__ModuleLoader__.load({
         toolPanel)
     }
 
+    /**
+     * The compact switch chip beside the New Session composer.
+     *
+     * A conversation that has not sent its first message renders the composer in
+     * its `hero` variant, and that variant does not render
+     * `conversation.composer.dock` at all — so the switches used to be reachable
+     * only after asking the model something. The New Session row
+     * (`conversation.hero.options`) exists there instead, so one chip lives
+     * there and edits the **profile default**, which is what a session with no
+     * saved list of its own follows anyway. Once the first message lands the
+     * composer switches to `composer` and the full dock takes over, so the two
+     * never show at the same time.
+     */
+    function HeroDock() {
+      // No session yet: this chip edits the default, which every new
+      // conversation follows until it saves a list of its own.
+      const slice = useSlice({ auto: true, sessionId: '' })
+      const [open, setOpen] = useState(readOpen)
+      const closePanel = useCallback(() => { writeOpen(''); setOpen('') }, [])
+      const { rootRef, spaceAbove } = useDockPanel(open, closePanel, 'down')
+      const toggle = () => {
+        const next = open === 'tools' ? '' : 'tools'
+        writeOpen(next)
+        setOpen(next)
+      }
+
+      const chip = h('button', {
+        type: 'button',
+        className: 'tsd-chip',
+        'data-on': String(open === 'tools'),
+        title: slice.needsRefresh
+          ? '插件已在服务端更新，这个页面还在跑旧版：刷新一次浏览器页面即可'
+          : '默认工具开关：新会话都用这套，直到某个对话单独保存自己的清单',
+        onClick: toggle,
+      },
+        h('span', { className: 'tsd-dot', 'aria-hidden': true }),
+        '默认工具 ',
+        h('b', null, slice.ready ? `${slice.enabledCount}/${slice.tools.length}` : '…'),
+        slice.needsRefresh ? h('span', { className: 'tsd-pill-warn tsd-pill-access' }, '需刷新') : null)
+
+      const panel = open === 'tools'
+        ? h('div', { className: 'tsd-pop', style: { maxHeight: `${spaceAbove}px`, width: 'min(560px, calc(100vw - 24px))' } },
+            h('div', { className: 'tsd-pop-head' },
+              h('span', { className: 'tsd-pop-title' }, '默认工具开关'),
+              h('span', { className: 'tsl-pill' }, '所有对话的起点'),
+              h('button', { type: 'button', className: 'tsd-close', onClick: closePanel, 'aria-label': '收起' }, '×')),
+            h('div', { className: 'tsd-pop-body' },
+              statsRow(slice),
+              scenarioRow(slice),
+              board(slice),
+              h('p', { className: 'tsd-note' },
+                '这里改的是默认值：还没单独保存过的对话都跟着它。这个对话发出第一条消息后，'
+                + '输入框下方会出现「工具」芯片，那时才能把它单独保存成这个对话的清单。'),
+              slice.needsRefresh ? h('p', { className: 'tsd-error' }, '插件已在服务端更新：刷新一次浏览器页面，就会出现完整的新界面（这个页面还停在旧版）。') : null,
+              slice.error !== '' ? h('p', { className: 'tsd-error' }, slice.error) : null),
+            h('div', { className: 'tsd-pop-foot' },
+              h('button', {
+                type: 'button',
+                className: 'tsl-button tsl-button-primary',
+                disabled: !slice.ready || slice.saving,
+                onClick: () => { void slice.saveAsDefault() },
+              }, slice.saving ? '保存中…' : '保存默认'),
+              h('button', {
+                type: 'button',
+                className: 'tsl-button',
+                disabled: !slice.ready || slice.saving || !slice.dirty,
+                onClick: () => { slice.adopt(slice.data); slice.setNotice('') },
+              }, '撤销'),
+              h('span', { className: 'tsl-status' }, slice.saving ? '保存中…' : slice.notice)))
+        : null
+
+      return h('div', { className: 'tsd tsd-hero', ref: rootRef },
+        h('style', null, css),
+        chip,
+        panel)
+    }
+
     return {
       inject: ['slots'],
       apply(ctx) {
-        ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register(
+        /**
+         * Mount one surface on its own.
+         *
+         * A page that rejects or lacks one slot must not lose the rest: an
+         * Android WebView was seen to stop a bare `apply` right after the first
+         * `slots.inject`, which left the user with no tool bar at all and no
+         * visible reason. Each entry is therefore independent, and a failure is
+         * reported on the console instead of aborting the others.
+         * @param {string} label what failed, for the console
+         * @param {() => void} mount the registration call
+         */
+        const surface = (label, mount) => {
+          try {
+            mount()
+          } catch (error) {
+            try {
+              console.error(`[tool-slice] ${label} 注册失败（其余面板继续）`, error)
+            } catch {
+              /* a page without console must still keep going */
+            }
+          }
+        }
+        surface('插件页配置卡', () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register(
           { name: 'plugins.bundle.config', key: NS },
           (props) => (props?.view === 'summary' ? summaryText() : h(ToolSliceCard, null)),
-        ))
+        )))
         // The command channel is optional: a page without the remote service
         // still renders the switches and reports the missing channel.
         let executeCommand
         if (typeof ctx.inject === 'function') {
-          ctx.inject(['remote', 'remote.commands'], (scope) => {
+          surface('指令通道', () => ctx.inject(['remote', 'remote.commands'], (scope) => {
             const commands = scope?.remote?.commands
             if (commands !== undefined && typeof commands.execute === 'function') {
               executeCommand = (sessionId, line) => commands.execute(sessionId, line, [])
             }
-          })
+          }))
         }
         // The composer dock is where a user looks while talking; the page stays
         // for a full edit, the dock for a one-click switch.
-        ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+        surface('输入框下工具条', () => ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
           name: 'conversation.composer.dock',
           id: 'tool-slice-dock',
           order: 20,
@@ -1388,7 +1571,17 @@ window.__ModuleLoader__.load({
               ? Promise.reject(new Error('这个页面没有指令通道（remote.commands 不可用），请重启 DSH 让插件生效'))
               : executeCommand(sessionId, line),
           }),
-        }, SliceDock))
+        }, SliceDock)))
+        // A brand-new conversation renders the composer in its `hero` variant,
+        // which never renders `conversation.composer.dock`: without this second
+        // entry the switches are unreachable until the first message exists.
+        // Both entries are a list slot the owner renders in mutually exclusive
+        // variants, so they are never on screen together.
+        surface('新会话默认工具条', () => ctx.slots.inject('conversation.hero.options', () => ctx.slots.register({
+          name: 'conversation.hero.options',
+          id: 'tool-slice-hero',
+          order: 20,
+        }, HeroDock)))
       },
     }
   },

@@ -362,16 +362,31 @@ export function patchStep(plan, n, patch) {
   const steps = Array.isArray(plan?.steps) ? plan.steps : []
   const target = steps.find((step) => step.n === n)
   if (target === undefined) return { plan, error: `没有第 ${n} 步` }
+  const edit = patch !== null && typeof patch === 'object' ? patch : {}
   const next = steps.map((step) => {
     if (step !== target) return step
-    if (patch.access !== undefined) {
-      return { ...step, access: normalizeAccess(patch.access), ...(patch.hidden === undefined ? { hidden: [] } : {}) }
+    // Every field the caller supplied is written in one pass. Branching on
+    // `access` first — the old shape — silently dropped a `model` (and a
+    // `hidden`) that arrived in the same request, which is exactly what the
+    // panel's "permission + model in one row" edit sends.
+    const patched = { ...step }
+    if (edit.model !== undefined) patched.model = oneLine(edit.model, 120)
+    const hiddenGiven = edit.hidden !== undefined
+    const accessGiven = edit.access !== undefined
+    if (hiddenGiven && accessGiven) {
+      // Both supplied: a non-empty deny list wins over the coarse label, which
+      // is the invariant the panel's "apply the same settings to every step"
+      // relies on. An empty list means "this tier, nothing denied".
+      patched.hidden = normalizeNames(edit.hidden)
+      patched.access = patched.hidden.length > 0 ? '' : normalizeAccess(edit.access)
+    } else if (hiddenGiven) {
+      patched.hidden = normalizeNames(edit.hidden)
+      patched.access = ''
+    } else if (accessGiven) {
+      patched.access = normalizeAccess(edit.access)
+      patched.hidden = []
     }
-    return {
-      ...step,
-      ...(patch.model === undefined ? {} : { model: oneLine(patch.model, 120) }),
-      ...(patch.hidden === undefined ? {} : { hidden: normalizeNames(patch.hidden), access: '' }),
-    }
+    return patched
   })
   return { plan: { ...plan, steps: next } }
 }
